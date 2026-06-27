@@ -5,10 +5,16 @@ use crate::{
 };
 use std::{
     collections::HashMap,
+    io::Write,
     path::PathBuf,
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     sync::{Arc, Mutex},
 };
+
+const TMUX_DETACH_KEY: &str = "C-q";
+const TMUX_SESSION_OPTIONS: &[(&str, &str)] =
+    &[("status", "off"), ("prefix", "None"), ("prefix2", "None")];
+const TMUX_WINDOW_OPTIONS: &[(&str, &str)] = &[("pane-border-status", "off")];
 
 pub trait SessionRuntime: Clone + Send + Sync + 'static {
     fn start(&self, session_id: &str, spec: &LaunchSpec) -> Result<RuntimeHandle>;
@@ -25,6 +31,7 @@ pub trait SessionRuntime: Clone + Send + Sync + 'static {
 pub struct FakeRuntime {
     sessions: Arc<Mutex<HashMap<String, FakeSession>>>,
     fail_start: bool,
+    fail_destroy: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +103,9 @@ impl SessionRuntime for FakeRuntime {
     }
 
     fn destroy(&self, session_id: &str) -> Result<()> {
+        if self.fail_destroy {
+            return Err(AppError::msg("fake runtime destroy failed"));
+        }
         self.sessions
             .lock()
             .map_err(|_| AppError::msg("fake runtime lock poisoned"))?
@@ -109,6 +119,15 @@ impl FakeRuntime {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             fail_start: true,
+            fail_destroy: false,
+        }
+    }
+
+    pub fn failing_destroy() -> Self {
+        Self {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            fail_start: false,
+            fail_destroy: true,
         }
     }
 }
@@ -164,16 +183,29 @@ impl SessionRuntime for TmuxRuntime {
             .arg("-lc")
             .arg(&launch_command);
         run_tmux(command)?;
+        if let Err(err) = configure_tmux_viewport(&tmux_id) {
+            let _ = kill_tmux_session(session_id);
+            return Err(err);
+        }
         Ok(RuntimeHandle { id: tmux_id })
     }
 
     fn attach(&self, session_id: &str) -> Result<()> {
+        let hotkey = TmuxDetachHotkey::install()?;
         let mut command = tmux();
         command
             .arg("attach-session")
             .arg("-t")
             .arg(tmux_session_name(session_id));
-        run_tmux_status(command)
+        let attach_result = run_tmux_status(command);
+        let restore_result = hotkey.restore();
+        match (attach_result, restore_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(err), Ok(())) | (Ok(()), Err(err)) => Err(err),
+            (Err(attach_err), Err(restore_err)) => Err(AppError::msg(format!(
+                "attach failed: {attach_err}; restore binding also failed: {restore_err}"
+            ))),
+        }
     }
 
     fn send(&self, session_id: &str, text: &str) -> Result<()> {
@@ -182,10 +214,18 @@ impl SessionRuntime for TmuxRuntime {
             .arg("send-keys")
             .arg("-t")
             .arg(tmux_session_name(session_id))
+            .arg("-l")
             .arg("--")
-            .arg(text)
+            .arg(text);
+        run_tmux(command)?;
+
+        let mut enter = tmux();
+        enter
+            .arg("send-keys")
+            .arg("-t")
+            .arg(tmux_session_name(session_id))
             .arg("Enter");
-        run_tmux(command)
+        run_tmux(enter)
     }
 
     fn capture(&self, session_id: &str, limit: usize, ansi: bool) -> Result<OutputPage> {
@@ -220,8 +260,8 @@ impl SessionRuntime for TmuxRuntime {
             .arg("has-session")
             .arg("-t")
             .arg(tmux_session_name(session_id));
-        let status = command.status()?;
-        if status.success() {
+        let output = command.output()?;
+        if output.status.success() {
             Ok(SessionStatus::Running)
         } else {
             Ok(SessionStatus::Stopped)
@@ -286,7 +326,7 @@ fn tmux_launch_command(tmux_id: &str, spec: &LaunchSpec) -> Result<String> {
 
 fn docker_launch_command(tmux_id: &str, spec: &LaunchSpec, sandbox: &SandboxLaunchSpec) -> String {
     format!(
-        "docker run --rm -i --name {} -v {} -w {} {} sh -lc {}",
+        "docker run --rm -it --name {} -v {} -w {} {} sh -lc {}",
         shell_quote(&format!("{tmux_id}-sandbox")),
         shell_quote(&format!("{}:{}", spec.cwd, sandbox.container_cwd)),
         shell_quote(&sandbox.container_cwd),
@@ -303,14 +343,129 @@ fn docker_available() -> bool {
 }
 
 fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+    crate::util::shell_quote(value)
 }
 
 fn tmux() -> Command {
     Command::new("tmux")
 }
 
+fn configure_tmux_viewport(tmux_id: &str) -> Result<()> {
+    for (option, value) in TMUX_SESSION_OPTIONS {
+        let mut command = tmux();
+        command
+            .arg("set-option")
+            .arg("-t")
+            .arg(tmux_id)
+            .arg(option)
+            .arg(value);
+        run_tmux(command)?;
+    }
+    for (option, value) in TMUX_WINDOW_OPTIONS {
+        let mut command = tmux();
+        command
+            .arg("set-window-option")
+            .arg("-t")
+            .arg(tmux_id)
+            .arg(option)
+            .arg(value);
+        run_tmux(command)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct TmuxDetachHotkey {
+    previous: Option<String>,
+}
+
+impl TmuxDetachHotkey {
+    fn install() -> Result<Self> {
+        let previous = tmux_root_binding(TMUX_DETACH_KEY)?;
+        bind_tmux_detach_key(TMUX_DETACH_KEY)?;
+        Ok(Self { previous })
+    }
+
+    fn restore(self) -> Result<()> {
+        restore_tmux_root_binding(TMUX_DETACH_KEY, self.previous.as_deref())
+    }
+}
+
+fn tmux_root_binding(key: &str) -> Result<Option<String>> {
+    let mut command = tmux();
+    command.arg("list-keys").arg("-T").arg("root").arg(key);
+    let output = command.output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(parse_tmux_binding(&output.stdout))
+}
+
+fn parse_tmux_binding(output: &[u8]) -> Option<String> {
+    let binding = String::from_utf8_lossy(output).trim().to_string();
+    (!binding.is_empty()).then_some(binding)
+}
+
+fn bind_tmux_detach_key(key: &str) -> Result<()> {
+    let mut command = tmux();
+    command
+        .arg("bind-key")
+        .arg("-T")
+        .arg("root")
+        .arg(key)
+        .arg("detach-client");
+    run_tmux(command)
+}
+
+fn restore_tmux_root_binding(key: &str, previous: Option<&str>) -> Result<()> {
+    match previous {
+        Some(binding) => source_tmux_command(binding),
+        None => {
+            let mut command = tmux();
+            command
+                .arg("unbind-key")
+                .arg("-q")
+                .arg("-T")
+                .arg("root")
+                .arg(key);
+            run_tmux(command)
+        }
+    }
+}
+
+fn source_tmux_command(command_text: &str) -> Result<()> {
+    let mut child = tmux()
+        .arg("source-file")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .spawn()?;
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| AppError::msg("tmux source stdin unavailable"))?;
+        stdin.write_all(command_text.as_bytes())?;
+        stdin.write_all(b"\n")?;
+    }
+    drop(child.stdin.take());
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(AppError::msg(format!("tmux exited status {status}")))
+    }
+}
+
 fn kill_tmux_session(session_id: &str) -> Result<()> {
+    let mut status = tmux();
+    status
+        .arg("has-session")
+        .arg("-t")
+        .arg(tmux_session_name(session_id));
+    if !status.output()?.status.success() {
+        return Ok(());
+    }
+
     let mut command = tmux();
     command
         .arg("kill-session")
@@ -443,6 +598,24 @@ mod tests {
     }
 
     #[test]
+    fn tmux_viewport_hides_chrome_and_uses_ctrl_q_escape() {
+        assert_eq!(TMUX_DETACH_KEY, "C-q");
+        assert!(TMUX_SESSION_OPTIONS.contains(&("status", "off")));
+        assert!(TMUX_SESSION_OPTIONS.contains(&("prefix", "None")));
+        assert!(TMUX_SESSION_OPTIONS.contains(&("prefix2", "None")));
+        assert!(TMUX_WINDOW_OPTIONS.contains(&("pane-border-status", "off")));
+    }
+
+    #[test]
+    fn tmux_binding_parser_ignores_empty_output() {
+        assert_eq!(parse_tmux_binding(b"\n"), None);
+        assert_eq!(
+            parse_tmux_binding(b"bind-key -T root C-q detach-client\n"),
+            Some("bind-key -T root C-q detach-client".to_string())
+        );
+    }
+
+    #[test]
     fn docker_launch_command_mounts_workspace_and_quotes_command() {
         let spec = LaunchSpec {
             cwd: "/tmp/project".to_string(),
@@ -455,10 +628,10 @@ mod tests {
         };
         let sandbox = spec.sandbox.as_ref().unwrap();
         let command = docker_launch_command("agent-helm-test", &spec, sandbox);
-        assert!(command.contains("docker run --rm -i"));
-        assert!(command.contains("--name 'agent-helm-test-sandbox'"));
+        assert!(command.contains("docker run --rm -it"));
+        assert!(command.contains("--name agent-helm-test-sandbox"));
         assert!(command.contains("-v '/tmp/project:/workspace'"));
-        assert!(command.contains("-w '/workspace'"));
+        assert!(command.contains("-w /workspace"));
         assert!(command.contains("'alpine:latest'"));
         assert!(command.contains("sh -lc 'printf '\\''hello world'\\'''"));
     }

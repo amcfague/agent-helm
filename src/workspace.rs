@@ -76,6 +76,17 @@ impl WorkspaceManager {
         branch: impl AsRef<str>,
         carry_state: bool,
     ) -> Result<WorktreeInfo> {
+        let branch = branch.as_ref();
+        self.create_named_worktree_with_state(project, branch, branch, carry_state)
+    }
+
+    pub fn create_named_worktree_with_state(
+        &self,
+        project: impl AsRef<Path>,
+        branch: impl AsRef<str>,
+        name: impl AsRef<str>,
+        carry_state: bool,
+    ) -> Result<WorktreeInfo> {
         let project = self.resolve_project_ref(project)?;
         let branch = branch.as_ref().trim();
         if branch.is_empty() {
@@ -84,39 +95,84 @@ impl WorkspaceManager {
 
         git_required(&project.root, ["check-ref-format", "--branch", branch])?;
 
-        let path = sibling_worktree_path(&project.root, branch)?;
-        if path.exists() {
-            return Err(AppError::msg(format!(
-                "worktree path already exists: {}",
-                path.display()
-            )));
+        let name = name.as_ref().trim();
+        let path =
+            sibling_worktree_path(&project.root, if name.is_empty() { branch } else { name })?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
         }
 
-        let base = project.default_branch.as_deref().unwrap_or("HEAD");
-        git_required_os(
+        let branch_ref = format!("refs/heads/{branch}");
+        if git_optional(
             &project.root,
-            [
-                OsStr::new("worktree"),
-                OsStr::new("add"),
-                OsStr::new("-b"),
-                OsStr::new(branch),
-                path.as_os_str(),
-                OsStr::new(base),
-            ],
-        )?;
+            ["rev-parse", "--verify", branch_ref.as_str()],
+        )
+        .is_some()
+        {
+            git_required_os(
+                &project.root,
+                [
+                    OsStr::new("worktree"),
+                    OsStr::new("add"),
+                    path.as_os_str(),
+                    OsStr::new(branch),
+                ],
+            )?;
+        } else {
+            let remote_branch_ref = format!("refs/remotes/origin/{branch}");
+            let remote_base = format!("origin/{branch}");
+            let base = if git_optional(
+                &project.root,
+                ["rev-parse", "--verify", remote_branch_ref.as_str()],
+            )
+            .is_some()
+            {
+                remote_base.as_str()
+            } else {
+                project.default_branch.as_deref().unwrap_or("HEAD")
+            };
+            git_required_os(
+                &project.root,
+                [
+                    OsStr::new("worktree"),
+                    OsStr::new("add"),
+                    OsStr::new("-b"),
+                    OsStr::new(branch),
+                    path.as_os_str(),
+                    OsStr::new(base),
+                ],
+            )?;
+        }
 
-        if carry_state {
-            carry_worktree_state(&project.root, &path)?;
+        if carry_state && let Err(error) = carry_worktree_state(&project.root, &path) {
+            remove_created_worktree(&project.root, &path);
+            return Err(error);
         }
 
         self.find_worktree(&project.root, &path)
     }
 
     pub fn finish_worktree(&self, worktree_path: impl AsRef<Path>) -> Result<()> {
-        self.remove_worktree(worktree_path)
+        self.remove_worktree_with_force(worktree_path, true)
+    }
+
+    pub fn discard_created_worktree(
+        &self,
+        project: impl AsRef<Path>,
+        worktree_path: impl AsRef<Path>,
+    ) {
+        remove_created_worktree(project.as_ref(), worktree_path.as_ref());
     }
 
     pub fn remove_worktree(&self, worktree_path: impl AsRef<Path>) -> Result<()> {
+        self.remove_worktree_with_force(worktree_path, false)
+    }
+
+    fn remove_worktree_with_force(
+        &self,
+        worktree_path: impl AsRef<Path>,
+        force: bool,
+    ) -> Result<()> {
         let path = existing_path(worktree_path.as_ref())?;
         let root = self.resolve_project(&path)?;
         let command_root = self
@@ -126,14 +182,13 @@ impl WorkspaceManager {
             .map(|worktree| worktree.path)
             .unwrap_or_else(|| root.clone());
 
-        git_required_os(
-            &command_root,
-            [
-                OsStr::new("worktree"),
-                OsStr::new("remove"),
-                path.as_os_str(),
-            ],
-        )?;
+        let mut args = vec![OsString::from("worktree"), OsString::from("remove")];
+        if force {
+            args.push(OsString::from("--force"));
+        }
+        args.push(path.as_os_str().to_os_string());
+
+        git_required_os(&command_root, args)?;
         Ok(())
     }
 
@@ -234,12 +289,28 @@ fn carry_worktree_state(source: &Path, target: &Path) -> Result<()> {
         }
     }
 
-    let untracked = String::from_utf8_lossy(&git_required_bytes(
+    let untracked =
+        git_required_bytes(source, ["ls-files", "--others", "--exclude-standard", "-z"])?;
+    copy_worktree_files(source, target, &untracked)?;
+
+    let ignored = git_required_bytes(
         source,
-        ["ls-files", "--others", "--exclude-standard", "-z"],
-    )?)
-    .to_string();
-    for relative in untracked.split('\0').filter(|item| !item.is_empty()) {
+        [
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+        ],
+    )?;
+    copy_worktree_files(source, target, &ignored)?;
+
+    Ok(())
+}
+
+fn copy_worktree_files(source: &Path, target: &Path, raw_files: &[u8]) -> Result<()> {
+    let files = String::from_utf8_lossy(raw_files);
+    for relative in files.split('\0').filter(|item| !item.is_empty()) {
         let from = source.join(relative);
         if from.is_file() {
             let to = target.join(relative);
@@ -250,6 +321,18 @@ fn carry_worktree_state(source: &Path, target: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn remove_created_worktree(project: &Path, path: &Path) {
+    let _ = git_required_os(
+        project,
+        [
+            OsStr::new("worktree"),
+            OsStr::new("remove"),
+            OsStr::new("--force"),
+            path.as_os_str(),
+        ],
+    );
 }
 
 fn read_project_hooks(root: &Path) -> Result<ProjectHooks> {
@@ -339,14 +422,7 @@ fn default_branch_for_root(root: &Path) -> Option<String> {
 }
 
 fn existing_path(path: &Path) -> Result<PathBuf> {
-    let path = expand_home(path);
-    if !path.exists() {
-        return Err(AppError::msg(format!(
-            "path does not exist: {}",
-            path.display()
-        )));
-    }
-    canonicalize_existing(&path)
+    crate::util::existing_path(path)
 }
 
 fn canonicalize_existing(path: &Path) -> Result<PathBuf> {
@@ -361,45 +437,73 @@ fn command_path(path: &Path) -> PathBuf {
     }
 }
 
-fn expand_home(path: &Path) -> PathBuf {
-    let raw = path.as_os_str().to_string_lossy();
-    if raw == "~" {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| path.to_path_buf())
-    } else if let Some(rest) = raw.strip_prefix("~/") {
-        std::env::var_os("HOME")
-            .map(|home| PathBuf::from(home).join(rest))
-            .unwrap_or_else(|| path.to_path_buf())
-    } else {
-        path.to_path_buf()
-    }
-}
-
-fn sibling_worktree_path(root: &Path, branch: &str) -> Result<PathBuf> {
+fn sibling_worktree_path(root: &Path, name: &str) -> Result<PathBuf> {
+    let worktrees = parse_worktrees(&git_required(root, ["worktree", "list", "--porcelain"])?)?;
+    let root = primary_worktree_root_from(root, &worktrees)?;
     let repo_name = root.file_name().and_then(OsStr::to_str).ok_or_else(|| {
         AppError::msg(format!("project has no directory name: {}", root.display()))
     })?;
-    let branch = branch_slug(branch);
-    Ok(root
+    let name = path_slug(name);
+    let base = root
         .parent()
         .unwrap_or_else(|| Path::new("."))
-        .join(format!("{repo_name}-{branch}")))
+        .join(format!("{repo_name}-worktrees"))
+        .join(name);
+    Ok(unique_path(base, &worktrees))
 }
 
-fn branch_slug(branch: &str) -> String {
-    let slug = branch
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
+fn primary_worktree_root_from(root: &Path, worktrees: &[WorktreeInfo]) -> Result<PathBuf> {
+    let primary = worktrees
+        .iter()
+        .find(|worktree| !worktree.is_bare)
+        .map(|worktree| worktree.path.clone())
+        .unwrap_or_else(|| root.to_path_buf());
+    canonicalize_existing(&primary)
+}
 
-    slug.trim_matches('-').to_string()
+fn unique_path(base: PathBuf, worktrees: &[WorktreeInfo]) -> PathBuf {
+    if !worktree_path_taken(&base, worktrees) {
+        return base;
+    }
+
+    let parent = base.parent().unwrap_or_else(|| Path::new("."));
+    let name = base
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("session");
+    for index in 2.. {
+        let candidate = parent.join(format!("{name}-{index}"));
+        if !worktree_path_taken(&candidate, worktrees) {
+            return candidate;
+        }
+    }
+
+    unreachable!("unbounded unique worktree path search")
+}
+
+fn worktree_path_taken(path: &Path, worktrees: &[WorktreeInfo]) -> bool {
+    fs::symlink_metadata(path).is_ok()
+        || worktrees
+            .iter()
+            .any(|worktree| worktree.path.as_path() == path)
+}
+
+fn path_slug(value: &str) -> String {
+    let mut slug = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            slug.push(ch.to_ascii_lowercase());
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() || slug.chars().all(|ch| ch == '.') {
+        "session".to_string()
+    } else {
+        slug.to_string()
+    }
 }
 
 fn parse_worktrees(raw: &str) -> Result<Vec<WorktreeInfo>> {
@@ -607,6 +711,14 @@ mod tests {
         let manager = WorkspaceManager;
 
         let worktree = manager.create_worktree(repo.path(), "agent/test")?;
+        let repo_root = repo.path().canonicalize()?;
+        let repo_name = repo_root.file_name().unwrap().to_string_lossy();
+        let expected_path = repo_root
+            .parent()
+            .unwrap()
+            .join(format!("{repo_name}-worktrees"))
+            .join("agent-test");
+        assert_eq!(worktree.path, expected_path);
         assert!(worktree.path.exists());
         assert_eq!(worktree.branch.as_deref(), Some("agent/test"));
 
@@ -615,6 +727,263 @@ mod tests {
 
         manager.finish_worktree(&worktree.path)?;
         assert!(!worktree.path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn named_worktree_uses_normalized_name_in_repo_sibling_directory() -> Result<()> {
+        if !git_available() {
+            return Ok(());
+        }
+
+        let repo = git_repo()?;
+        let manager = WorkspaceManager;
+
+        let worktree = manager.create_named_worktree_with_state(
+            repo.path(),
+            "agent/named",
+            "Codex Session",
+            false,
+        )?;
+        let repo_root = repo.path().canonicalize()?;
+        let repo_name = repo_root.file_name().unwrap().to_string_lossy();
+        let expected_path = repo_root
+            .parent()
+            .unwrap()
+            .join(format!("{repo_name}-worktrees"))
+            .join("codex-session");
+
+        assert_eq!(worktree.path, expected_path);
+        assert!(worktree.path.exists());
+
+        manager.finish_worktree(&worktree.path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn named_worktree_dot_names_stay_under_repo_sibling_directory() -> Result<()> {
+        if !git_available() {
+            return Ok(());
+        }
+
+        let repo = git_repo()?;
+        let manager = WorkspaceManager;
+
+        let worktree =
+            manager.create_named_worktree_with_state(repo.path(), "agent/dot-name", "..", false)?;
+        let repo_root = repo.path().canonicalize()?;
+        let repo_name = repo_root.file_name().unwrap().to_string_lossy();
+        let expected_path = repo_root
+            .parent()
+            .unwrap()
+            .join(format!("{repo_name}-worktrees"))
+            .join("session");
+
+        assert_eq!(worktree.path, expected_path);
+        assert!(worktree.path.exists());
+
+        manager.finish_worktree(&worktree.path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn linked_worktree_creates_sibling_under_primary_repo_worktrees() -> Result<()> {
+        if !git_available() {
+            return Ok(());
+        }
+        let repo = git_repo()?;
+        let manager = WorkspaceManager;
+        let source = manager.create_named_worktree_with_state(
+            repo.path(),
+            "agent/source",
+            "source",
+            false,
+        )?;
+        let child = manager.create_named_worktree_with_state(
+            &source.path,
+            "agent/child",
+            "Child Session",
+            false,
+        )?;
+        let repo_root = repo.path().canonicalize()?;
+        let repo_name = repo_root.file_name().unwrap().to_string_lossy();
+        let expected_parent = repo_root
+            .parent()
+            .unwrap()
+            .join(format!("{repo_name}-worktrees"));
+        assert_eq!(child.path, expected_parent.join("child-session"));
+        assert!(child.path.exists());
+        manager.finish_worktree(&child.path)?;
+        manager.finish_worktree(&source.path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn named_worktree_paths_get_unique_suffixes() -> Result<()> {
+        if !git_available() {
+            return Ok(());
+        }
+
+        let repo = git_repo()?;
+        let manager = WorkspaceManager;
+
+        let first =
+            manager.create_named_worktree_with_state(repo.path(), "agent/first", "same", false)?;
+        let second =
+            manager.create_named_worktree_with_state(repo.path(), "agent/second", "same", false)?;
+
+        assert_ne!(first.path, second.path);
+        assert_eq!(first.path.file_name().and_then(OsStr::to_str), Some("same"));
+        assert_eq!(
+            second.path.file_name().and_then(OsStr::to_str),
+            Some("same-2")
+        );
+
+        manager.finish_worktree(&first.path)?;
+        manager.finish_worktree(&second.path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn named_worktree_path_skips_existing_directory_collision() -> Result<()> {
+        if !git_available() {
+            return Ok(());
+        }
+
+        let repo = git_repo()?;
+        let repo_root = repo.path().canonicalize()?;
+        let repo_name = repo_root.file_name().unwrap().to_string_lossy();
+        let worktree_parent = repo_root
+            .parent()
+            .unwrap()
+            .join(format!("{repo_name}-worktrees"));
+        fs::create_dir_all(worktree_parent.join("same"))?;
+
+        let manager = WorkspaceManager;
+        let worktree = manager.create_named_worktree_with_state(
+            repo.path(),
+            "agent/collision",
+            "same",
+            false,
+        )?;
+
+        assert_eq!(
+            worktree.path.file_name().and_then(OsStr::to_str),
+            Some("same-2")
+        );
+
+        manager.finish_worktree(&worktree.path)?;
+        fs::remove_dir_all(worktree_parent)?;
+        Ok(())
+    }
+
+    #[test]
+    fn named_worktree_path_skips_missing_registered_worktree() -> Result<()> {
+        if !git_available() {
+            return Ok(());
+        }
+
+        let repo = git_repo()?;
+        let manager = WorkspaceManager;
+
+        let stale =
+            manager.create_named_worktree_with_state(repo.path(), "agent/stale", "same", false)?;
+        fs::remove_dir_all(&stale.path)?;
+
+        let worktree =
+            manager.create_named_worktree_with_state(repo.path(), "agent/next", "same", false)?;
+
+        assert_ne!(worktree.path, stale.path);
+        assert_eq!(
+            worktree.path.file_name().and_then(OsStr::to_str),
+            Some("same-2")
+        );
+        assert!(worktree.path.exists());
+
+        manager.finish_worktree(&worktree.path)?;
+        manager.discard_created_worktree(repo.path(), &stale.path);
+        Ok(())
+    }
+
+    #[test]
+    fn creates_new_branch_from_default_branch_not_current_branch() -> Result<()> {
+        if !git_available() {
+            return Ok(());
+        }
+
+        let repo = git_repo()?;
+        run_git(repo.path(), ["checkout", "-b", "topic/current"])?;
+        fs::write(repo.path().join("topic.txt"), "current only\n")?;
+        run_git(repo.path(), ["add", "topic.txt"])?;
+        run_git(repo.path(), ["commit", "-m", "topic change"])?;
+
+        let manager = WorkspaceManager;
+        let worktree = manager.create_worktree(repo.path(), "agent/default-base")?;
+
+        assert_eq!(
+            fs::read_to_string(worktree.path.join("README.md"))?,
+            "test\n"
+        );
+        assert!(!worktree.path.join("topic.txt").exists());
+
+        manager.finish_worktree(&worktree.path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn creates_worktree_for_existing_branch() -> Result<()> {
+        if !git_available() {
+            return Ok(());
+        }
+
+        let repo = git_repo()?;
+        run_git(repo.path(), ["checkout", "-b", "agent/existing"])?;
+        fs::write(repo.path().join("existing.txt"), "existing branch\n")?;
+        run_git(repo.path(), ["add", "existing.txt"])?;
+        run_git(repo.path(), ["commit", "-m", "existing branch"])?;
+        run_git(repo.path(), ["checkout", "main"])?;
+        let manager = WorkspaceManager;
+
+        let worktree = manager.create_worktree(repo.path(), "agent/existing")?;
+        assert!(worktree.path.exists());
+        assert_eq!(worktree.branch.as_deref(), Some("agent/existing"));
+        assert_eq!(
+            fs::read_to_string(worktree.path.join("existing.txt"))?,
+            "existing branch\n"
+        );
+
+        manager.finish_worktree(&worktree.path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn creates_worktree_for_remote_tracking_branch() -> Result<()> {
+        if !git_available() {
+            return Ok(());
+        }
+        let repo = git_repo()?;
+        let origin = TempDir::new()?;
+        run_git(origin.path(), ["init", "--bare"])?;
+        run_git(
+            repo.path(),
+            ["remote", "add", "origin", origin.path().to_str().unwrap()],
+        )?;
+        run_git(repo.path(), ["checkout", "-b", "agent/remote"])?;
+        fs::write(repo.path().join("remote.txt"), "from origin\n")?;
+        run_git(repo.path(), ["add", "remote.txt"])?;
+        run_git(repo.path(), ["commit", "-m", "remote branch"])?;
+        run_git(repo.path(), ["push", "-u", "origin", "agent/remote"])?;
+        run_git(repo.path(), ["checkout", "main"])?;
+        run_git(repo.path(), ["branch", "-D", "agent/remote"])?;
+
+        let manager = WorkspaceManager;
+        let worktree = manager.create_worktree(repo.path(), "agent/remote")?;
+
+        assert_eq!(
+            fs::read_to_string(worktree.path.join("remote.txt"))?,
+            "from origin\n"
+        );
+        manager.finish_worktree(&worktree.path)?;
         Ok(())
     }
 
@@ -629,6 +998,10 @@ mod tests {
         let notes = repo.path().join("notes");
         fs::create_dir(&notes)?;
         fs::write(notes.join("todo.txt"), "copy me\n")?;
+        fs::write(repo.path().join(".gitignore"), "ignored/\n")?;
+        let ignored = repo.path().join("ignored");
+        fs::create_dir(&ignored)?;
+        fs::write(ignored.join("local.env"), "SECRET=copy\n")?;
 
         let manager = WorkspaceManager;
         let worktree = manager.create_worktree_with_state(repo.path(), "agent/carry", true)?;
@@ -641,10 +1014,125 @@ mod tests {
             fs::read_to_string(worktree.path.join("notes/todo.txt"))?,
             "copy me\n"
         );
+        assert_eq!(
+            fs::read_to_string(worktree.path.join("ignored/local.env"))?,
+            "SECRET=copy\n"
+        );
 
         run_git(&worktree.path, ["reset", "--hard"])?;
-        run_git(&worktree.path, ["clean", "-fd"])?;
+        run_git(&worktree.path, ["clean", "-fdx"])?;
         manager.finish_worktree(&worktree.path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn removes_created_worktree_when_carry_state_fails() -> Result<()> {
+        if !git_available() {
+            return Ok(());
+        }
+
+        let repo = git_repo()?;
+        run_git(repo.path(), ["checkout", "-b", "agent/conflict"])?;
+        fs::write(repo.path().join("README.md"), "branch\n")?;
+        run_git(repo.path(), ["add", "README.md"])?;
+        run_git(repo.path(), ["commit", "-m", "branch change"])?;
+        run_git(repo.path(), ["checkout", "main"])?;
+        fs::write(repo.path().join("README.md"), "dirty\n")?;
+
+        let manager = WorkspaceManager;
+        let path = sibling_worktree_path(repo.path(), "agent/conflict")?;
+
+        assert!(
+            manager
+                .create_worktree_with_state(repo.path(), "agent/conflict", true)
+                .is_err()
+        );
+        assert!(!path.exists());
+        assert!(
+            !manager
+                .list_worktrees(repo.path())?
+                .iter()
+                .any(|entry| entry.path == path)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn discards_created_worktree_after_setup_hook_failure() -> Result<()> {
+        if !git_available() {
+            return Ok(());
+        }
+
+        let repo = git_repo()?;
+        fs::write(
+            repo.path().join(".agent-helm.toml"),
+            r#"
+[hooks]
+setup = "printf setup-started > setup.txt && exit 7"
+"#,
+        )?;
+
+        let manager = WorkspaceManager;
+        let worktree = manager.create_worktree(repo.path(), "agent/setup-fails")?;
+
+        assert!(
+            manager
+                .run_setup_hooks(repo.path(), &worktree.path)
+                .is_err()
+        );
+        assert!(worktree.path.join("setup.txt").exists());
+        assert!(
+            manager
+                .list_worktrees(repo.path())?
+                .iter()
+                .any(|entry| entry.path == worktree.path)
+        );
+
+        manager.discard_created_worktree(repo.path(), &worktree.path);
+
+        assert!(!worktree.path.exists());
+        assert!(
+            !manager
+                .list_worktrees(repo.path())?
+                .iter()
+                .any(|entry| entry.path == worktree.path)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn finish_worktree_removes_after_teardown_hook_creates_untracked_file() -> Result<()> {
+        if !git_available() {
+            return Ok(());
+        }
+
+        let repo = git_repo()?;
+        fs::write(
+            repo.path().join(".agent-helm.toml"),
+            r#"
+[hooks]
+teardown = "printf teardown > teardown.txt"
+"#,
+        )?;
+
+        let manager = WorkspaceManager;
+        let worktree = manager.create_worktree(repo.path(), "agent/teardown-dirty")?;
+
+        manager.run_teardown_hooks(repo.path(), &worktree.path)?;
+        assert_eq!(
+            fs::read_to_string(worktree.path.join("teardown.txt"))?,
+            "teardown"
+        );
+
+        manager.finish_worktree(&worktree.path)?;
+
+        assert!(!worktree.path.exists());
+        assert!(
+            !manager
+                .list_worktrees(repo.path())?
+                .iter()
+                .any(|entry| entry.path == worktree.path)
+        );
         Ok(())
     }
 

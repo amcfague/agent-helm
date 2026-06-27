@@ -136,29 +136,7 @@ pub fn redact_json_value(value: Value) -> Value {
 }
 
 fn existing_path(path: &Path) -> Result<PathBuf> {
-    let path = expand_home(path);
-    if !path.exists() {
-        return Err(AppError::msg(format!(
-            "path does not exist: {}",
-            path.display()
-        )));
-    }
-    Ok(path.canonicalize()?)
-}
-
-fn expand_home(path: &Path) -> PathBuf {
-    let raw = path.as_os_str().to_string_lossy();
-    if raw == "~" {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| path.to_path_buf())
-    } else if let Some(rest) = raw.strip_prefix("~/") {
-        std::env::var_os("HOME")
-            .map(|home| PathBuf::from(home).join(rest))
-            .unwrap_or_else(|| path.to_path_buf())
-    } else {
-        path.to_path_buf()
-    }
+    crate::util::existing_path(path)
 }
 
 fn bearer_value_at(input: &str, index: usize) -> Option<(usize, usize)> {

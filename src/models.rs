@@ -1,7 +1,16 @@
 use serde::{Deserialize, Serialize};
+use strum::{EnumString, IntoStaticStr};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Parse a snake_case string into an enum variant, returning `default` on mismatch.
+macro_rules! from_db {
+    ($ty:ty, $value:expr, $default:expr) => {
+        <$ty as std::str::FromStr>::from_str($value).unwrap_or($default)
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, IntoStaticStr, EnumString)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum SessionStatus {
     Starting,
     Running,
@@ -11,22 +20,58 @@ pub enum SessionStatus {
 
 impl SessionStatus {
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Starting => "starting",
-            Self::Running => "running",
-            Self::Stopped => "stopped",
-            Self::Errored => "errored",
-        }
+        self.into()
     }
 
     pub fn from_db(value: &str) -> Self {
-        match value {
-            "starting" => Self::Starting,
-            "running" => Self::Running,
-            "errored" => Self::Errored,
-            _ => Self::Stopped,
-        }
+        from_db!(Self, value, Self::Stopped)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, IntoStaticStr, EnumString)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum SessionDeckStatus {
+    Starting,
+    Running,
+    Queued,
+    Waiting,
+    Idle,
+    Stopped,
+    Errored,
+}
+
+impl SessionDeckStatus {
+    pub fn as_str(self) -> &'static str {
+        self.into()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionDeckStatusDerivation {
+    pub deck_status: SessionDeckStatus,
+    pub source_event_id: Option<i64>,
+    pub source: String,
+    pub activity: Option<SessionActivity>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionStatusSnapshot {
+    pub session: SessionRecord,
+    pub lifecycle_status: SessionStatus,
+    pub deck_status: SessionDeckStatus,
+    pub source_event_id: Option<i64>,
+    pub source: String,
+    pub activity: Option<SessionActivity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionActivity {
+    pub state: String,
+    pub label: String,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +115,31 @@ pub struct StructuredEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentStateSyncResult {
+    pub session_id: String,
+    pub synced: bool,
+    pub source: String,
+    pub event: Option<SessionEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSearchResponse {
+    pub query: String,
+    pub results: Vec<SessionSearchResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSearchResult {
+    pub session_id: String,
+    pub session_name: String,
+    pub group_name: String,
+    pub agent: String,
+    pub cwd: String,
+    pub source: String,
+    pub snippet: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupRecord {
     pub id: String,
     pub profile: String,
@@ -83,8 +153,9 @@ pub struct GroupRecord {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, IntoStaticStr, EnumString)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum ProjectTrustState {
     Trusted,
     Untrusted,
@@ -92,17 +163,11 @@ pub enum ProjectTrustState {
 
 impl ProjectTrustState {
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Trusted => "trusted",
-            Self::Untrusted => "untrusted",
-        }
+        self.into()
     }
 
     pub fn from_db(value: &str) -> Self {
-        match value {
-            "trusted" => Self::Trusted,
-            _ => Self::Untrusted,
-        }
+        from_db!(Self, value, Self::Untrusted)
     }
 }
 
@@ -153,8 +218,9 @@ pub struct WorkspaceRecord {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, IntoStaticStr, EnumString)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum WorktreeStatus {
     Creating,
     Ready,
@@ -164,21 +230,11 @@ pub enum WorktreeStatus {
 
 impl WorktreeStatus {
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Creating => "creating",
-            Self::Ready => "ready",
-            Self::Finished => "finished",
-            Self::Errored => "errored",
-        }
+        self.into()
     }
 
     pub fn from_db(value: &str) -> Self {
-        match value {
-            "creating" => Self::Creating,
-            "ready" => Self::Ready,
-            "finished" => Self::Finished,
-            _ => Self::Errored,
-        }
+        from_db!(Self, value, Self::Errored)
     }
 }
 
@@ -235,8 +291,9 @@ pub struct ForkSessionResult {
     pub started: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, IntoStaticStr, EnumString)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum DeleteMode {
     MetadataOnly,
     CleanupWorktree,
@@ -245,19 +302,11 @@ pub enum DeleteMode {
 
 impl DeleteMode {
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::MetadataOnly => "metadata_only",
-            Self::CleanupWorktree => "cleanup_worktree",
-            Self::Purge => "purge",
-        }
+        self.into()
     }
 
     pub fn from_db(value: &str) -> Self {
-        match value {
-            "cleanup_worktree" => Self::CleanupWorktree,
-            "purge" => Self::Purge,
-            _ => Self::MetadataOnly,
-        }
+        from_db!(Self, value, Self::MetadataOnly)
     }
 }
 
@@ -293,8 +342,9 @@ pub struct ArchiveSessionResult {
     pub runtime_stopped: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, IntoStaticStr, EnumString)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum AttachmentStatus {
     Pending,
     Attached,
@@ -304,21 +354,11 @@ pub enum AttachmentStatus {
 
 impl AttachmentStatus {
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Attached => "attached",
-            Self::Detached => "detached",
-            Self::Errored => "errored",
-        }
+        self.into()
     }
 
     pub fn from_db(value: &str) -> Self {
-        match value {
-            "attached" => Self::Attached,
-            "detached" => Self::Detached,
-            "errored" => Self::Errored,
-            _ => Self::Pending,
-        }
+        from_db!(Self, value, Self::Pending)
     }
 }
 
@@ -355,8 +395,9 @@ pub struct SkillAttachmentRecord {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, IntoStaticStr, EnumString)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum WatcherStatus {
     Starting,
     Running,
@@ -366,21 +407,11 @@ pub enum WatcherStatus {
 
 impl WatcherStatus {
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Starting => "starting",
-            Self::Running => "running",
-            Self::Stopped => "stopped",
-            Self::Errored => "errored",
-        }
+        self.into()
     }
 
     pub fn from_db(value: &str) -> Self {
-        match value {
-            "starting" => Self::Starting,
-            "running" => Self::Running,
-            "errored" => Self::Errored,
-            _ => Self::Stopped,
-        }
+        from_db!(Self, value, Self::Stopped)
     }
 }
 
@@ -412,8 +443,9 @@ pub struct WatcherEventRecord {
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, IntoStaticStr, EnumString)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum ConductorStatus {
     Starting,
     Running,
@@ -423,21 +455,11 @@ pub enum ConductorStatus {
 
 impl ConductorStatus {
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Starting => "starting",
-            Self::Running => "running",
-            Self::Stopped => "stopped",
-            Self::Errored => "errored",
-        }
+        self.into()
     }
 
     pub fn from_db(value: &str) -> Self {
-        match value {
-            "starting" => Self::Starting,
-            "running" => Self::Running,
-            "errored" => Self::Errored,
-            _ => Self::Stopped,
-        }
+        from_db!(Self, value, Self::Stopped)
     }
 }
 

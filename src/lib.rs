@@ -10,4 +10,5 @@ pub mod runtime;
 pub mod security;
 pub mod store;
 pub mod tui;
+pub mod util;
 pub mod workspace;

@@ -306,47 +306,44 @@ impl SessionStore {
     }
 
     pub fn create_session(&self, session: &SessionRecord) -> Result<SessionRecord> {
-        let _lock = self.lock_profile()?;
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        Self::ensure_group_in(
-            &tx,
-            &session.profile,
-            &session.group_name,
-            &session.project_path,
-            session.created_at,
-        )?;
-        tx.execute(
-            r#"
-            INSERT INTO sessions (
-                id, name, profile, group_name, agent, command, project_path, status,
-                runtime_id, archived, version, created_at, updated_at,
-                project_id, workspace_id, worktree_id, parent_session_id
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
-            "#,
-            params![
-                session.id,
-                session.name,
-                session.profile,
-                session.group_name,
-                session.agent,
-                session.command,
-                session.project_path,
-                session.status.as_str(),
-                session.runtime_id,
-                bool_to_int(session.archived),
-                session.version,
+        self.with_transaction(|tx| {
+            Self::ensure_group_in(
+                tx,
+                &session.profile,
+                &session.group_name,
+                &session.project_path,
                 session.created_at,
-                session.updated_at,
-                session.project_id,
-                session.workspace_id,
-                session.worktree_id,
-                session.parent_session_id,
-            ],
-        )?;
-        let session = Self::get_session_in(&tx, &session.id)?;
-        tx.commit()?;
-        Ok(session)
+            )?;
+            tx.execute(
+                r#"
+                INSERT INTO sessions (
+                    id, name, profile, group_name, agent, command, project_path, status,
+                    runtime_id, archived, version, created_at, updated_at,
+                    project_id, workspace_id, worktree_id, parent_session_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                "#,
+                params![
+                    session.id,
+                    session.name,
+                    session.profile,
+                    session.group_name,
+                    session.agent,
+                    session.command,
+                    session.project_path,
+                    session.status.as_str(),
+                    session.runtime_id,
+                    bool_to_int(session.archived),
+                    session.version,
+                    session.created_at,
+                    session.updated_at,
+                    session.project_id,
+                    session.workspace_id,
+                    session.worktree_id,
+                    session.parent_session_id,
+                ],
+            )?;
+            Self::get_session_in(tx, &session.id)
+        })
     }
 
     pub fn list_sessions(&self, include_archived: bool) -> Result<Vec<SessionRecord>> {
@@ -392,14 +389,81 @@ impl SessionStore {
         name: &str,
         default_project_path: &str,
     ) -> Result<GroupRecord> {
-        let _lock = self.lock_profile()?;
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        let now = now_ts();
-        Self::ensure_group_in(&tx, profile, name, default_project_path, now)?;
-        let group = Self::get_group_in(&tx, profile, name)?;
-        tx.commit()?;
-        Ok(group)
+        self.with_transaction(|tx| {
+            let now = now_ts();
+            Self::ensure_group_in(tx, profile, name, default_project_path, now)?;
+            Self::get_group_in(tx, profile, name)
+        })
+    }
+
+    pub fn update_group(
+        &self,
+        profile: &str,
+        name: &str,
+        default_project_path: Option<&str>,
+        collapsed: Option<bool>,
+    ) -> Result<GroupRecord> {
+        self.with_transaction(|tx| {
+            let group = Self::get_group_in(tx, profile, name)?;
+            let changed = tx.execute(
+                r#"
+                UPDATE groups
+                SET default_project_path = ?3, collapsed = ?4, version = version + 1, updated_at = ?5
+                WHERE profile = ?1 AND name = ?2 AND version = ?6
+                "#,
+                params![
+                    profile,
+                    name,
+                    default_project_path.unwrap_or(&group.default_project_path),
+                    bool_to_int(collapsed.unwrap_or(group.collapsed)),
+                    now_ts(),
+                    group.version,
+                ],
+            )?;
+            ensure_changed(changed, "group version conflict", name)?;
+            Self::get_group_in(tx, profile, name)
+        })
+    }
+
+    pub fn delete_group(
+        &self,
+        profile: &str,
+        name: &str,
+        force: bool,
+        replacement_group: &str,
+    ) -> Result<()> {
+        self.with_transaction(|tx| {
+            Self::get_group_in(tx, profile, name)?;
+            let session_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM sessions WHERE profile = ?1 AND group_name = ?2",
+                params![profile, name],
+                |row| row.get(0),
+            )?;
+            if session_count > 0 && !force {
+                return Err(AppError::msg(format!(
+                    "group has {session_count} sessions; use --force to move them"
+                )));
+            }
+            if session_count > 0 {
+                if replacement_group == name {
+                    return Err(AppError::msg("cannot delete group with no replacement"));
+                }
+                Self::ensure_group_in(tx, profile, replacement_group, "", now_ts())?;
+                tx.execute(
+                    r#"
+                    UPDATE sessions
+                    SET group_name = ?3, version = version + 1, updated_at = ?4
+                    WHERE profile = ?1 AND group_name = ?2
+                    "#,
+                    params![profile, name, replacement_group, now_ts()],
+                )?;
+            }
+            let changed = tx.execute(
+                "DELETE FROM groups WHERE profile = ?1 AND name = ?2",
+                params![profile, name],
+            )?;
+            ensure_changed(changed, "group not found", name)
+        })
     }
 
     pub fn update_session_group(
@@ -408,29 +472,26 @@ impl SessionStore {
         expected_version: i64,
         group_name: &str,
     ) -> Result<SessionRecord> {
-        let _lock = self.lock_profile()?;
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        let current = Self::get_session_in(&tx, id)?;
-        Self::ensure_group_in(
-            &tx,
-            &current.profile,
-            group_name,
-            &current.project_path,
-            now_ts(),
-        )?;
-        let changed = tx.execute(
-            r#"
-            UPDATE sessions
-            SET group_name = ?3, version = version + 1, updated_at = ?4
-            WHERE id = ?1 AND version = ?2
-            "#,
-            params![id, expected_version, group_name, now_ts()],
-        )?;
-        ensure_changed(changed, "session version conflict", id)?;
-        let session = Self::get_session_in(&tx, id)?;
-        tx.commit()?;
-        Ok(session)
+        self.with_transaction(|tx| {
+            let current = Self::get_session_in(tx, id)?;
+            Self::ensure_group_in(
+                tx,
+                &current.profile,
+                group_name,
+                &current.project_path,
+                now_ts(),
+            )?;
+            let changed = tx.execute(
+                r#"
+                UPDATE sessions
+                SET group_name = ?3, version = version + 1, updated_at = ?4
+                WHERE id = ?1 AND version = ?2
+                "#,
+                params![id, expected_version, group_name, now_ts()],
+            )?;
+            ensure_changed(changed, "session version conflict", id)?;
+            Self::get_session_in(tx, id)
+        })
     }
 
     pub fn update_runtime(
@@ -440,21 +501,18 @@ impl SessionStore {
         runtime_id: Option<String>,
         status: SessionStatus,
     ) -> Result<SessionRecord> {
-        let _lock = self.lock_profile()?;
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        let changed = tx.execute(
-            r#"
-            UPDATE sessions
-            SET runtime_id = ?3, status = ?4, version = version + 1, updated_at = ?5
-            WHERE id = ?1 AND version = ?2
-            "#,
-            params![id, expected_version, runtime_id, status.as_str(), now_ts()],
-        )?;
-        ensure_changed(changed, "session version conflict", id)?;
-        let session = Self::get_session_in(&tx, id)?;
-        tx.commit()?;
-        Ok(session)
+        self.with_transaction(|tx| {
+            let changed = tx.execute(
+                r#"
+                UPDATE sessions
+                SET runtime_id = ?3, status = ?4, version = version + 1, updated_at = ?5
+                WHERE id = ?1 AND version = ?2
+                "#,
+                params![id, expected_version, runtime_id, status.as_str(), now_ts()],
+            )?;
+            ensure_changed(changed, "session version conflict", id)?;
+            Self::get_session_in(tx, id)
+        })
     }
 
     pub fn update_status(
@@ -463,21 +521,18 @@ impl SessionStore {
         expected_version: i64,
         status: SessionStatus,
     ) -> Result<SessionRecord> {
-        let _lock = self.lock_profile()?;
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        let changed = tx.execute(
-            r#"
-            UPDATE sessions
-            SET status = ?3, version = version + 1, updated_at = ?4
-            WHERE id = ?1 AND version = ?2
-            "#,
-            params![id, expected_version, status.as_str(), now_ts()],
-        )?;
-        ensure_changed(changed, "session version conflict", id)?;
-        let session = Self::get_session_in(&tx, id)?;
-        tx.commit()?;
-        Ok(session)
+        self.with_transaction(|tx| {
+            let changed = tx.execute(
+                r#"
+                UPDATE sessions
+                SET status = ?3, version = version + 1, updated_at = ?4
+                WHERE id = ?1 AND version = ?2
+                "#,
+                params![id, expected_version, status.as_str(), now_ts()],
+            )?;
+            ensure_changed(changed, "session version conflict", id)?;
+            Self::get_session_in(tx, id)
+        })
     }
 
     pub fn append_session_event(
@@ -486,21 +541,18 @@ impl SessionStore {
         kind: &str,
         payload: Value,
     ) -> Result<SessionEvent> {
-        let _lock = self.lock_profile()?;
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        let created_at = now_ts();
-        let payload = serde_json::to_string(&redact_json_value(payload))?;
-        tx.execute(
-            r#"
-            INSERT INTO session_events (session_id, kind, payload, created_at)
-            VALUES (?1, ?2, ?3, ?4)
-            "#,
-            params![session_id, kind, payload, created_at],
-        )?;
-        let event = Self::get_session_event_in(&tx, tx.last_insert_rowid())?;
-        tx.commit()?;
-        Ok(event)
+        self.with_transaction(|tx| {
+            let created_at = now_ts();
+            let payload = serde_json::to_string(&redact_json_value(payload))?;
+            tx.execute(
+                r#"
+                INSERT INTO session_events (session_id, kind, payload, created_at)
+                VALUES (?1, ?2, ?3, ?4)
+                "#,
+                params![session_id, kind, payload, created_at],
+            )?;
+            Self::get_session_event_in(tx, tx.last_insert_rowid())
+        })
     }
 
     pub fn append_cost_event(
@@ -509,21 +561,18 @@ impl SessionStore {
         amount_usd: f64,
         payload: Value,
     ) -> Result<CostEvent> {
-        let _lock = self.lock_profile()?;
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        let created_at = now_ts();
-        let payload = serde_json::to_string(&redact_json_value(payload))?;
-        tx.execute(
-            r#"
-            INSERT INTO cost_events (session_id, amount_usd, payload, created_at)
-            VALUES (?1, ?2, ?3, ?4)
-            "#,
-            params![session_id, amount_usd, payload, created_at],
-        )?;
-        let event = Self::get_cost_event_in(&tx, tx.last_insert_rowid())?;
-        tx.commit()?;
-        Ok(event)
+        self.with_transaction(|tx| {
+            let created_at = now_ts();
+            let payload = serde_json::to_string(&redact_json_value(payload))?;
+            tx.execute(
+                r#"
+                INSERT INTO cost_events (session_id, amount_usd, payload, created_at)
+                VALUES (?1, ?2, ?3, ?4)
+                "#,
+                params![session_id, amount_usd, payload, created_at],
+            )?;
+            Self::get_cost_event_in(tx, tx.last_insert_rowid())
+        })
     }
 
     pub fn session_events(
@@ -547,102 +596,165 @@ impl SessionStore {
             .map_err(Into::into)
     }
 
-    pub fn remove_session(&self, id: &str) -> Result<()> {
-        let _lock = self.lock_profile()?;
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        let related_rows: i64 = tx.query_row(
+    pub fn latest_session_events(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionEvent>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
             r#"
-            SELECT
-                (SELECT COUNT(*) FROM session_events WHERE session_id = ?1) +
-                (SELECT COUNT(*) FROM cost_events WHERE session_id = ?1)
+            SELECT id, session_id, kind, payload, created_at
+            FROM session_events
+            WHERE session_id = ?1
+            ORDER BY id DESC
+            LIMIT ?2
             "#,
-            params![id],
-            |row| row.get(0),
         )?;
+        let rows = stmt.query_map(params![session_id, limit as i64], Self::read_event)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
 
-        let changed = if related_rows == 0 {
-            tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])?
-        } else {
-            let changed = tx.execute(
-                "UPDATE sessions SET archived = 1, version = version + 1, updated_at = ?2 WHERE id = ?1",
-                params![id, now_ts()],
+    pub fn latest_session_status_signal_events(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionEvent>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, session_id, kind, payload, created_at
+            FROM session_events
+            WHERE session_id = ?1 AND kind IN ('agent_state', 'input')
+            ORDER BY id DESC
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = stmt.query_map(params![session_id, limit as i64], Self::read_event)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn latest_session_agent_state_events(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionEvent>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, session_id, kind, payload, created_at
+            FROM session_events
+            WHERE session_id = ?1 AND kind = 'agent_state'
+            ORDER BY id DESC
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = stmt.query_map(params![session_id, limit as i64], Self::read_event)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn remove_session(&self, id: &str) -> Result<()> {
+        self.with_transaction(|tx| {
+            let related_rows: i64 = tx.query_row(
+                r#"
+                SELECT
+                    (SELECT COUNT(*) FROM session_events WHERE session_id = ?1) +
+                    (SELECT COUNT(*) FROM cost_events WHERE session_id = ?1)
+                "#,
+                params![id],
+                |row| row.get(0),
             )?;
-            if changed > 0 {
-                tx.execute(
-                    "INSERT INTO session_events (session_id, kind, payload, created_at) VALUES (?1, ?2, ?3, ?4)",
-                    params![
-                        id,
-                        "archive",
-                        serde_json::to_string(&json!({ "source": "remove_session" }))?,
-                        now_ts()
-                    ],
-                )?;
-            }
-            changed
-        };
 
-        ensure_changed(changed, "session not found", id)?;
-        tx.commit()?;
-        Ok(())
+            let changed = if related_rows == 0 {
+                tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])?
+            } else {
+                let changed = tx.execute(
+                    "UPDATE sessions SET archived = 1, status = ?3, runtime_id = NULL, version = version + 1, updated_at = ?2 WHERE id = ?1",
+                    params![id, now_ts(), SessionStatus::Stopped.as_str()],
+                )?;
+                if changed > 0 {
+                    tx.execute(
+                        "INSERT INTO session_events (session_id, kind, payload, created_at) VALUES (?1, ?2, ?3, ?4)",
+                        params![
+                            id,
+                            "archive",
+                            serde_json::to_string(&json!({ "source": "remove_session" }))?,
+                            now_ts()
+                        ],
+                    )?;
+                }
+                changed
+            };
+
+            ensure_changed(changed, "session not found", id)
+        })
     }
 
     pub fn archive_session(&self, id: &str) -> Result<SessionRecord> {
-        let _lock = self.lock_profile()?;
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        let changed = tx.execute(
-            r#"
-            UPDATE sessions
-            SET archived = 1, version = version + 1, updated_at = ?2
-            WHERE id = ?1
-            "#,
-            params![id, now_ts()],
-        )?;
-        ensure_changed(changed, "session not found", id)?;
-        let session = Self::get_session_in(&tx, id)?;
-        tx.commit()?;
-        Ok(session)
+        self.with_transaction(|tx| {
+            let changed = tx.execute(
+                r#"
+                UPDATE sessions
+                SET archived = 1, version = version + 1, updated_at = ?2
+                WHERE id = ?1
+                "#,
+                params![id, now_ts()],
+            )?;
+            ensure_changed(changed, "session not found", id)?;
+            Self::get_session_in(tx, id)
+        })
+    }
+
+    pub fn restore_session(&self, id: &str) -> Result<SessionRecord> {
+        self.with_transaction(|tx| {
+            let changed = tx.execute(
+                r#"
+                UPDATE sessions
+                SET archived = 0, version = version + 1, updated_at = ?2
+                WHERE id = ?1
+                "#,
+                params![id, now_ts()],
+            )?;
+            ensure_changed(changed, "session not found", id)?;
+            Self::get_session_in(tx, id)
+        })
     }
 
     pub fn purge_session(&self, id: &str) -> Result<()> {
-        let _lock = self.lock_profile()?;
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        let changed = tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
-        ensure_changed(changed, "session not found", id)?;
-        tx.commit()?;
-        Ok(())
+        self.with_transaction(|tx| {
+            let changed = tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+            ensure_changed(changed, "session not found", id)
+        })
     }
 
     pub fn create_project(&self, project: &ProjectRecord) -> Result<ProjectRecord> {
-        let _lock = self.lock_profile()?;
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        tx.execute(
-            r#"
-            INSERT INTO projects (
-                id, profile, root_path, repo_identity, default_branch, trust_state,
-                hooks_hash, config_hash, version, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-            "#,
-            params![
-                project.id,
-                project.profile,
-                project.root_path,
-                project.repo_identity,
-                project.default_branch,
-                project.trust_state.as_str(),
-                project.hooks_hash,
-                project.config_hash,
-                project.version,
-                project.created_at,
-                project.updated_at,
-            ],
-        )?;
-        let project = Self::get_project_in(&tx, &project.id)?;
-        tx.commit()?;
-        Ok(project)
+        self.with_transaction(|tx| {
+            tx.execute(
+                r#"
+                INSERT INTO projects (
+                    id, profile, root_path, repo_identity, default_branch, trust_state,
+                    hooks_hash, config_hash, version, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                "#,
+                params![
+                    project.id,
+                    project.profile,
+                    project.root_path,
+                    project.repo_identity,
+                    project.default_branch,
+                    project.trust_state.as_str(),
+                    project.hooks_hash,
+                    project.config_hash,
+                    project.version,
+                    project.created_at,
+                    project.updated_at,
+                ],
+            )?;
+            Self::get_project_in(tx, &project.id)
+        })
     }
 
     pub fn get_project(&self, id: &str) -> Result<ProjectRecord> {
@@ -665,34 +777,31 @@ impl SessionStore {
         project: &ProjectRecord,
         expected_version: i64,
     ) -> Result<ProjectRecord> {
-        let _lock = self.lock_profile()?;
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        let changed = tx.execute(
-            r#"
-            UPDATE projects
-            SET profile = ?1, root_path = ?2, repo_identity = ?3, default_branch = ?4,
-                trust_state = ?5, hooks_hash = ?6, config_hash = ?7,
-                version = version + 1, updated_at = ?8
-            WHERE id = ?9 AND version = ?10
-            "#,
-            params![
-                project.profile,
-                project.root_path,
-                project.repo_identity,
-                project.default_branch,
-                project.trust_state.as_str(),
-                project.hooks_hash,
-                project.config_hash,
-                project.updated_at,
-                project.id,
-                expected_version,
-            ],
-        )?;
-        ensure_changed(changed, "project version conflict", &project.id)?;
-        let project = Self::get_project_in(&tx, &project.id)?;
-        tx.commit()?;
-        Ok(project)
+        self.with_transaction(|tx| {
+            let changed = tx.execute(
+                r#"
+                UPDATE projects
+                SET profile = ?1, root_path = ?2, repo_identity = ?3, default_branch = ?4,
+                    trust_state = ?5, hooks_hash = ?6, config_hash = ?7,
+                    version = version + 1, updated_at = ?8
+                WHERE id = ?9 AND version = ?10
+                "#,
+                params![
+                    project.profile,
+                    project.root_path,
+                    project.repo_identity,
+                    project.default_branch,
+                    project.trust_state.as_str(),
+                    project.hooks_hash,
+                    project.config_hash,
+                    project.updated_at,
+                    project.id,
+                    expected_version,
+                ],
+            )?;
+            ensure_changed(changed, "project version conflict", &project.id)?;
+            Self::get_project_in(tx, &project.id)
+        })
     }
 
     pub fn delete_project(&self, id: &str) -> Result<()> {
@@ -700,32 +809,29 @@ impl SessionStore {
     }
 
     pub fn create_workspace(&self, workspace: &WorkspaceRecord) -> Result<WorkspaceRecord> {
-        let _lock = self.lock_profile()?;
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        tx.execute(
-            r#"
-            INSERT INTO workspaces (
-                id, project_id, path, worktree_id, sandbox_id, multi_repo_roots,
-                cleanup_policy, version, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-            "#,
-            params![
-                workspace.id,
-                workspace.project_id,
-                workspace.path,
-                workspace.worktree_id,
-                workspace.sandbox_id,
-                workspace.multi_repo_roots,
-                workspace.cleanup_policy,
-                workspace.version,
-                workspace.created_at,
-                workspace.updated_at,
-            ],
-        )?;
-        let workspace = Self::get_workspace_in(&tx, &workspace.id)?;
-        tx.commit()?;
-        Ok(workspace)
+        self.with_transaction(|tx| {
+            tx.execute(
+                r#"
+                INSERT INTO workspaces (
+                    id, project_id, path, worktree_id, sandbox_id, multi_repo_roots,
+                    cleanup_policy, version, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                "#,
+                params![
+                    workspace.id,
+                    workspace.project_id,
+                    workspace.path,
+                    workspace.worktree_id,
+                    workspace.sandbox_id,
+                    workspace.multi_repo_roots,
+                    workspace.cleanup_policy,
+                    workspace.version,
+                    workspace.created_at,
+                    workspace.updated_at,
+                ],
+            )?;
+            Self::get_workspace_in(tx, &workspace.id)
+        })
     }
 
     pub fn get_workspace(&self, id: &str) -> Result<WorkspaceRecord> {
@@ -748,33 +854,30 @@ impl SessionStore {
         workspace: &WorkspaceRecord,
         expected_version: i64,
     ) -> Result<WorkspaceRecord> {
-        let _lock = self.lock_profile()?;
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        let changed = tx.execute(
-            r#"
-            UPDATE workspaces
-            SET project_id = ?1, path = ?2, worktree_id = ?3, sandbox_id = ?4,
-                multi_repo_roots = ?5, cleanup_policy = ?6,
-                version = version + 1, updated_at = ?7
-            WHERE id = ?8 AND version = ?9
-            "#,
-            params![
-                workspace.project_id,
-                workspace.path,
-                workspace.worktree_id,
-                workspace.sandbox_id,
-                workspace.multi_repo_roots,
-                workspace.cleanup_policy,
-                workspace.updated_at,
-                workspace.id,
-                expected_version,
-            ],
-        )?;
-        ensure_changed(changed, "workspace version conflict", &workspace.id)?;
-        let workspace = Self::get_workspace_in(&tx, &workspace.id)?;
-        tx.commit()?;
-        Ok(workspace)
+        self.with_transaction(|tx| {
+            let changed = tx.execute(
+                r#"
+                UPDATE workspaces
+                SET project_id = ?1, path = ?2, worktree_id = ?3, sandbox_id = ?4,
+                    multi_repo_roots = ?5, cleanup_policy = ?6,
+                    version = version + 1, updated_at = ?7
+                WHERE id = ?8 AND version = ?9
+                "#,
+                params![
+                    workspace.project_id,
+                    workspace.path,
+                    workspace.worktree_id,
+                    workspace.sandbox_id,
+                    workspace.multi_repo_roots,
+                    workspace.cleanup_policy,
+                    workspace.updated_at,
+                    workspace.id,
+                    expected_version,
+                ],
+            )?;
+            ensure_changed(changed, "workspace version conflict", &workspace.id)?;
+            Self::get_workspace_in(tx, &workspace.id)
+        })
     }
 
     pub fn delete_workspace(&self, id: &str) -> Result<()> {
@@ -782,32 +885,29 @@ impl SessionStore {
     }
 
     pub fn create_worktree(&self, worktree: &WorktreeRecord) -> Result<WorktreeRecord> {
-        let _lock = self.lock_profile()?;
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        tx.execute(
-            r#"
-            INSERT INTO worktrees (
-                id, project_id, path, branch, base_branch, status, cleanup_allowed,
-                version, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-            "#,
-            params![
-                worktree.id,
-                worktree.project_id,
-                worktree.path,
-                worktree.branch,
-                worktree.base_branch,
-                worktree.status.as_str(),
-                bool_to_int(worktree.cleanup_allowed),
-                worktree.version,
-                worktree.created_at,
-                worktree.updated_at,
-            ],
-        )?;
-        let worktree = Self::get_worktree_in(&tx, &worktree.id)?;
-        tx.commit()?;
-        Ok(worktree)
+        self.with_transaction(|tx| {
+            tx.execute(
+                r#"
+                INSERT INTO worktrees (
+                    id, project_id, path, branch, base_branch, status, cleanup_allowed,
+                    version, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                "#,
+                params![
+                    worktree.id,
+                    worktree.project_id,
+                    worktree.path,
+                    worktree.branch,
+                    worktree.base_branch,
+                    worktree.status.as_str(),
+                    bool_to_int(worktree.cleanup_allowed),
+                    worktree.version,
+                    worktree.created_at,
+                    worktree.updated_at,
+                ],
+            )?;
+            Self::get_worktree_in(tx, &worktree.id)
+        })
     }
 
     pub fn get_worktree(&self, id: &str) -> Result<WorktreeRecord> {
@@ -830,33 +930,30 @@ impl SessionStore {
         worktree: &WorktreeRecord,
         expected_version: i64,
     ) -> Result<WorktreeRecord> {
-        let _lock = self.lock_profile()?;
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        let changed = tx.execute(
-            r#"
-            UPDATE worktrees
-            SET project_id = ?1, path = ?2, branch = ?3, base_branch = ?4,
-                status = ?5, cleanup_allowed = ?6,
-                version = version + 1, updated_at = ?7
-            WHERE id = ?8 AND version = ?9
-            "#,
-            params![
-                worktree.project_id,
-                worktree.path,
-                worktree.branch,
-                worktree.base_branch,
-                worktree.status.as_str(),
-                bool_to_int(worktree.cleanup_allowed),
-                worktree.updated_at,
-                worktree.id,
-                expected_version,
-            ],
-        )?;
-        ensure_changed(changed, "worktree version conflict", &worktree.id)?;
-        let worktree = Self::get_worktree_in(&tx, &worktree.id)?;
-        tx.commit()?;
-        Ok(worktree)
+        self.with_transaction(|tx| {
+            let changed = tx.execute(
+                r#"
+                UPDATE worktrees
+                SET project_id = ?1, path = ?2, branch = ?3, base_branch = ?4,
+                    status = ?5, cleanup_allowed = ?6,
+                    version = version + 1, updated_at = ?7
+                WHERE id = ?8 AND version = ?9
+                "#,
+                params![
+                    worktree.project_id,
+                    worktree.path,
+                    worktree.branch,
+                    worktree.base_branch,
+                    worktree.status.as_str(),
+                    bool_to_int(worktree.cleanup_allowed),
+                    worktree.updated_at,
+                    worktree.id,
+                    expected_version,
+                ],
+            )?;
+            ensure_changed(changed, "worktree version conflict", &worktree.id)?;
+            Self::get_worktree_in(tx, &worktree.id)
+        })
     }
 
     pub fn delete_worktree(&self, id: &str) -> Result<()> {
@@ -867,34 +964,31 @@ impl SessionStore {
         &self,
         attachment: &McpAttachmentRecord,
     ) -> Result<McpAttachmentRecord> {
-        let _lock = self.lock_profile()?;
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        tx.execute(
-            r#"
-            INSERT INTO mcp_attachments (
-                id, profile, scope, project_id, session_id, server_id, status,
-                materialized_state, restart_required, version, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-            "#,
-            params![
-                attachment.id,
-                attachment.profile,
-                attachment.scope,
-                attachment.project_id,
-                attachment.session_id,
-                attachment.server_id,
-                attachment.status.as_str(),
-                attachment.materialized_state,
-                bool_to_int(attachment.restart_required),
-                attachment.version,
-                attachment.created_at,
-                attachment.updated_at,
-            ],
-        )?;
-        let attachment = Self::get_mcp_attachment_in(&tx, &attachment.id)?;
-        tx.commit()?;
-        Ok(attachment)
+        self.with_transaction(|tx| {
+            tx.execute(
+                r#"
+                INSERT INTO mcp_attachments (
+                    id, profile, scope, project_id, session_id, server_id, status,
+                    materialized_state, restart_required, version, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                "#,
+                params![
+                    attachment.id,
+                    attachment.profile,
+                    attachment.scope,
+                    attachment.project_id,
+                    attachment.session_id,
+                    attachment.server_id,
+                    attachment.status.as_str(),
+                    attachment.materialized_state,
+                    bool_to_int(attachment.restart_required),
+                    attachment.version,
+                    attachment.created_at,
+                    attachment.updated_at,
+                ],
+            )?;
+            Self::get_mcp_attachment_in(tx, &attachment.id)
+        })
     }
 
     pub fn get_mcp_attachment(&self, id: &str) -> Result<McpAttachmentRecord> {
@@ -933,35 +1027,32 @@ impl SessionStore {
         attachment: &McpAttachmentRecord,
         expected_version: i64,
     ) -> Result<McpAttachmentRecord> {
-        let _lock = self.lock_profile()?;
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        let changed = tx.execute(
-            r#"
-            UPDATE mcp_attachments
-            SET profile = ?1, scope = ?2, project_id = ?3, session_id = ?4,
-                server_id = ?5, status = ?6, materialized_state = ?7,
-                restart_required = ?8, version = version + 1, updated_at = ?9
-            WHERE id = ?10 AND version = ?11
-            "#,
-            params![
-                attachment.profile,
-                attachment.scope,
-                attachment.project_id,
-                attachment.session_id,
-                attachment.server_id,
-                attachment.status.as_str(),
-                attachment.materialized_state,
-                bool_to_int(attachment.restart_required),
-                attachment.updated_at,
-                attachment.id,
-                expected_version,
-            ],
-        )?;
-        ensure_changed(changed, "mcp attachment version conflict", &attachment.id)?;
-        let attachment = Self::get_mcp_attachment_in(&tx, &attachment.id)?;
-        tx.commit()?;
-        Ok(attachment)
+        self.with_transaction(|tx| {
+            let changed = tx.execute(
+                r#"
+                UPDATE mcp_attachments
+                SET profile = ?1, scope = ?2, project_id = ?3, session_id = ?4,
+                    server_id = ?5, status = ?6, materialized_state = ?7,
+                    restart_required = ?8, version = version + 1, updated_at = ?9
+                WHERE id = ?10 AND version = ?11
+                "#,
+                params![
+                    attachment.profile,
+                    attachment.scope,
+                    attachment.project_id,
+                    attachment.session_id,
+                    attachment.server_id,
+                    attachment.status.as_str(),
+                    attachment.materialized_state,
+                    bool_to_int(attachment.restart_required),
+                    attachment.updated_at,
+                    attachment.id,
+                    expected_version,
+                ],
+            )?;
+            ensure_changed(changed, "mcp attachment version conflict", &attachment.id)?;
+            Self::get_mcp_attachment_in(tx, &attachment.id)
+        })
     }
 
     pub fn delete_mcp_attachment(&self, id: &str) -> Result<()> {
@@ -972,35 +1063,32 @@ impl SessionStore {
         &self,
         attachment: &SkillAttachmentRecord,
     ) -> Result<SkillAttachmentRecord> {
-        let _lock = self.lock_profile()?;
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        tx.execute(
-            r#"
-            INSERT INTO skill_attachments (
-                id, profile, scope, project_id, session_id, skill_id, pool_path,
-                materialized_path, status, restart_required, version, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-            "#,
-            params![
-                attachment.id,
-                attachment.profile,
-                attachment.scope,
-                attachment.project_id,
-                attachment.session_id,
-                attachment.skill_id,
-                attachment.pool_path,
-                attachment.materialized_path,
-                attachment.status.as_str(),
-                bool_to_int(attachment.restart_required),
-                attachment.version,
-                attachment.created_at,
-                attachment.updated_at,
-            ],
-        )?;
-        let attachment = Self::get_skill_attachment_in(&tx, &attachment.id)?;
-        tx.commit()?;
-        Ok(attachment)
+        self.with_transaction(|tx| {
+            tx.execute(
+                r#"
+                INSERT INTO skill_attachments (
+                    id, profile, scope, project_id, session_id, skill_id, pool_path,
+                    materialized_path, status, restart_required, version, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                "#,
+                params![
+                    attachment.id,
+                    attachment.profile,
+                    attachment.scope,
+                    attachment.project_id,
+                    attachment.session_id,
+                    attachment.skill_id,
+                    attachment.pool_path,
+                    attachment.materialized_path,
+                    attachment.status.as_str(),
+                    bool_to_int(attachment.restart_required),
+                    attachment.version,
+                    attachment.created_at,
+                    attachment.updated_at,
+                ],
+            )?;
+            Self::get_skill_attachment_in(tx, &attachment.id)
+        })
     }
 
     pub fn get_skill_attachment(&self, id: &str) -> Result<SkillAttachmentRecord> {
@@ -1039,37 +1127,34 @@ impl SessionStore {
         attachment: &SkillAttachmentRecord,
         expected_version: i64,
     ) -> Result<SkillAttachmentRecord> {
-        let _lock = self.lock_profile()?;
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        let changed = tx.execute(
-            r#"
-            UPDATE skill_attachments
-            SET profile = ?1, scope = ?2, project_id = ?3, session_id = ?4,
-                skill_id = ?5, pool_path = ?6, materialized_path = ?7,
-                status = ?8, restart_required = ?9,
-                version = version + 1, updated_at = ?10
-            WHERE id = ?11 AND version = ?12
-            "#,
-            params![
-                attachment.profile,
-                attachment.scope,
-                attachment.project_id,
-                attachment.session_id,
-                attachment.skill_id,
-                attachment.pool_path,
-                attachment.materialized_path,
-                attachment.status.as_str(),
-                bool_to_int(attachment.restart_required),
-                attachment.updated_at,
-                attachment.id,
-                expected_version,
-            ],
-        )?;
-        ensure_changed(changed, "skill attachment version conflict", &attachment.id)?;
-        let attachment = Self::get_skill_attachment_in(&tx, &attachment.id)?;
-        tx.commit()?;
-        Ok(attachment)
+        self.with_transaction(|tx| {
+            let changed = tx.execute(
+                r#"
+                UPDATE skill_attachments
+                SET profile = ?1, scope = ?2, project_id = ?3, session_id = ?4,
+                    skill_id = ?5, pool_path = ?6, materialized_path = ?7,
+                    status = ?8, restart_required = ?9,
+                    version = version + 1, updated_at = ?10
+                WHERE id = ?11 AND version = ?12
+                "#,
+                params![
+                    attachment.profile,
+                    attachment.scope,
+                    attachment.project_id,
+                    attachment.session_id,
+                    attachment.skill_id,
+                    attachment.pool_path,
+                    attachment.materialized_path,
+                    attachment.status.as_str(),
+                    bool_to_int(attachment.restart_required),
+                    attachment.updated_at,
+                    attachment.id,
+                    expected_version,
+                ],
+            )?;
+            ensure_changed(changed, "skill attachment version conflict", &attachment.id)?;
+            Self::get_skill_attachment_in(tx, &attachment.id)
+        })
     }
 
     pub fn delete_skill_attachment(&self, id: &str) -> Result<()> {
@@ -1077,33 +1162,30 @@ impl SessionStore {
     }
 
     pub fn create_watcher(&self, watcher: &WatcherRecord) -> Result<WatcherRecord> {
-        let _lock = self.lock_profile()?;
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        tx.execute(
-            r#"
-            INSERT INTO watchers (
-                id, profile, project_id, adapter_id, name, config_ref, status,
-                last_event_at, version, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-            "#,
-            params![
-                watcher.id,
-                watcher.profile,
-                watcher.project_id,
-                watcher.adapter_id,
-                watcher.name,
-                watcher.config_ref,
-                watcher.status.as_str(),
-                watcher.last_event_at,
-                watcher.version,
-                watcher.created_at,
-                watcher.updated_at,
-            ],
-        )?;
-        let watcher = Self::get_watcher_in(&tx, &watcher.id)?;
-        tx.commit()?;
-        Ok(watcher)
+        self.with_transaction(|tx| {
+            tx.execute(
+                r#"
+                INSERT INTO watchers (
+                    id, profile, project_id, adapter_id, name, config_ref, status,
+                    last_event_at, version, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                "#,
+                params![
+                    watcher.id,
+                    watcher.profile,
+                    watcher.project_id,
+                    watcher.adapter_id,
+                    watcher.name,
+                    watcher.config_ref,
+                    watcher.status.as_str(),
+                    watcher.last_event_at,
+                    watcher.version,
+                    watcher.created_at,
+                    watcher.updated_at,
+                ],
+            )?;
+            Self::get_watcher_in(tx, &watcher.id)
+        })
     }
 
     pub fn get_watcher(&self, id: &str) -> Result<WatcherRecord> {
@@ -1134,34 +1216,31 @@ impl SessionStore {
         watcher: &WatcherRecord,
         expected_version: i64,
     ) -> Result<WatcherRecord> {
-        let _lock = self.lock_profile()?;
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        let changed = tx.execute(
-            r#"
-            UPDATE watchers
-            SET profile = ?1, project_id = ?2, adapter_id = ?3, name = ?4,
-                config_ref = ?5, status = ?6, last_event_at = ?7,
-                version = version + 1, updated_at = ?8
-            WHERE id = ?9 AND version = ?10
-            "#,
-            params![
-                watcher.profile,
-                watcher.project_id,
-                watcher.adapter_id,
-                watcher.name,
-                watcher.config_ref,
-                watcher.status.as_str(),
-                watcher.last_event_at,
-                watcher.updated_at,
-                watcher.id,
-                expected_version,
-            ],
-        )?;
-        ensure_changed(changed, "watcher version conflict", &watcher.id)?;
-        let watcher = Self::get_watcher_in(&tx, &watcher.id)?;
-        tx.commit()?;
-        Ok(watcher)
+        self.with_transaction(|tx| {
+            let changed = tx.execute(
+                r#"
+                UPDATE watchers
+                SET profile = ?1, project_id = ?2, adapter_id = ?3, name = ?4,
+                    config_ref = ?5, status = ?6, last_event_at = ?7,
+                    version = version + 1, updated_at = ?8
+                WHERE id = ?9 AND version = ?10
+                "#,
+                params![
+                    watcher.profile,
+                    watcher.project_id,
+                    watcher.adapter_id,
+                    watcher.name,
+                    watcher.config_ref,
+                    watcher.status.as_str(),
+                    watcher.last_event_at,
+                    watcher.updated_at,
+                    watcher.id,
+                    expected_version,
+                ],
+            )?;
+            ensure_changed(changed, "watcher version conflict", &watcher.id)?;
+            Self::get_watcher_in(tx, &watcher.id)
+        })
     }
 
     pub fn delete_watcher(&self, id: &str) -> Result<()> {
@@ -1169,55 +1248,52 @@ impl SessionStore {
     }
 
     pub fn append_watcher_event(&self, event: &WatcherEventRecord) -> Result<WatcherEventRecord> {
-        let _lock = self.lock_profile()?;
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        let payload_ref = redact_event_payload(&event.payload_ref);
-        tx.execute(
-            r#"
-            INSERT INTO watcher_events (
-                id, watcher_id, source, event_type, payload_ref, signature_status,
-                route_decision, delivered, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-            "#,
-            params![
-                event.id,
-                event.watcher_id,
-                event.source,
-                event.event_type,
-                payload_ref,
-                event.signature_status,
-                event.route_decision,
-                bool_to_int(event.delivered),
-                event.created_at,
-            ],
-        )?;
-        tx.execute(
-            "UPDATE watchers SET last_event_at = MAX(last_event_at, ?2), updated_at = MAX(updated_at, ?2) WHERE id = ?1",
-            params![event.watcher_id, event.created_at],
-        )?;
-        let event = Self::get_watcher_event_in(&tx, &event.id)?;
-        tx.commit()?;
-        Ok(event)
+        self.with_transaction(|tx| {
+            let payload_ref = redact_event_payload(&event.payload_ref);
+            tx.execute(
+                r#"
+                INSERT INTO watcher_events (
+                    id, watcher_id, source, event_type, payload_ref, signature_status,
+                    route_decision, delivered, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "#,
+                params![
+                    event.id,
+                    event.watcher_id,
+                    event.source,
+                    event.event_type,
+                    payload_ref,
+                    event.signature_status,
+                    event.route_decision,
+                    bool_to_int(event.delivered),
+                    event.created_at,
+                ],
+            )?;
+            tx.execute(
+                "UPDATE watchers SET last_event_at = MAX(last_event_at, ?2), updated_at = MAX(updated_at, ?2) WHERE id = ?1",
+                params![event.watcher_id, event.created_at],
+            )?;
+            Self::get_watcher_event_in(tx, &event.id)
+        })
     }
 
     pub fn list_watcher_events(
         &self,
         watcher_id: &str,
-        since: i64,
+        offset: usize,
         limit: usize,
     ) -> Result<Vec<WatcherEventRecord>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             r#"
             SELECT * FROM watcher_events
-            WHERE watcher_id = ?1 AND created_at > ?2
-            ORDER BY created_at ASC
-            LIMIT ?3
+            WHERE watcher_id = ?1
+            ORDER BY created_at ASC, id ASC
+            LIMIT ?2 OFFSET ?3
             "#,
         )?;
         let rows = stmt.query_map(
-            params![watcher_id, since, limit as i64],
+            params![watcher_id, limit as i64, offset as i64],
             Self::read_watcher_event,
         )?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1225,32 +1301,29 @@ impl SessionStore {
     }
 
     pub fn create_conductor(&self, conductor: &ConductorRecord) -> Result<ConductorRecord> {
-        let _lock = self.lock_profile()?;
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        tx.execute(
-            r#"
-            INSERT INTO conductors (
-                id, profile, session_id, status, watched_sessions, channel_bindings,
-                last_heartbeat_at, version, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-            "#,
-            params![
-                conductor.id,
-                conductor.profile,
-                conductor.session_id,
-                conductor.status.as_str(),
-                conductor.watched_sessions,
-                conductor.channel_bindings,
-                conductor.last_heartbeat_at,
-                conductor.version,
-                conductor.created_at,
-                conductor.updated_at,
-            ],
-        )?;
-        let conductor = Self::get_conductor_in(&tx, &conductor.id)?;
-        tx.commit()?;
-        Ok(conductor)
+        self.with_transaction(|tx| {
+            tx.execute(
+                r#"
+                INSERT INTO conductors (
+                    id, profile, session_id, status, watched_sessions, channel_bindings,
+                    last_heartbeat_at, version, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                "#,
+                params![
+                    conductor.id,
+                    conductor.profile,
+                    conductor.session_id,
+                    conductor.status.as_str(),
+                    conductor.watched_sessions,
+                    conductor.channel_bindings,
+                    conductor.last_heartbeat_at,
+                    conductor.version,
+                    conductor.created_at,
+                    conductor.updated_at,
+                ],
+            )?;
+            Self::get_conductor_in(tx, &conductor.id)
+        })
     }
 
     pub fn get_conductor(&self, id: &str) -> Result<ConductorRecord> {
@@ -1273,33 +1346,30 @@ impl SessionStore {
         conductor: &ConductorRecord,
         expected_version: i64,
     ) -> Result<ConductorRecord> {
-        let _lock = self.lock_profile()?;
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        let changed = tx.execute(
-            r#"
-            UPDATE conductors
-            SET profile = ?1, session_id = ?2, status = ?3, watched_sessions = ?4,
-                channel_bindings = ?5, last_heartbeat_at = ?6,
-                version = version + 1, updated_at = ?7
-            WHERE id = ?8 AND version = ?9
-            "#,
-            params![
-                conductor.profile,
-                conductor.session_id,
-                conductor.status.as_str(),
-                conductor.watched_sessions,
-                conductor.channel_bindings,
-                conductor.last_heartbeat_at,
-                conductor.updated_at,
-                conductor.id,
-                expected_version,
-            ],
-        )?;
-        ensure_changed(changed, "conductor version conflict", &conductor.id)?;
-        let conductor = Self::get_conductor_in(&tx, &conductor.id)?;
-        tx.commit()?;
-        Ok(conductor)
+        self.with_transaction(|tx| {
+            let changed = tx.execute(
+                r#"
+                UPDATE conductors
+                SET profile = ?1, session_id = ?2, status = ?3, watched_sessions = ?4,
+                    channel_bindings = ?5, last_heartbeat_at = ?6,
+                    version = version + 1, updated_at = ?7
+                WHERE id = ?8 AND version = ?9
+                "#,
+                params![
+                    conductor.profile,
+                    conductor.session_id,
+                    conductor.status.as_str(),
+                    conductor.watched_sessions,
+                    conductor.channel_bindings,
+                    conductor.last_heartbeat_at,
+                    conductor.updated_at,
+                    conductor.id,
+                    expected_version,
+                ],
+            )?;
+            ensure_changed(changed, "conductor version conflict", &conductor.id)?;
+            Self::get_conductor_in(tx, &conductor.id)
+        })
     }
 
     pub fn delete_conductor(&self, id: &str) -> Result<()> {
@@ -1310,28 +1380,48 @@ impl SessionStore {
         &self,
         assignment: &ConductorAssignmentRecord,
     ) -> Result<ConductorAssignmentRecord> {
-        let _lock = self.lock_profile()?;
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        tx.execute(
-            r#"
-            INSERT INTO conductor_assignments (
-                id, conductor_id, session_id, task_ref, status, assigned_at, completed_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-            "#,
-            params![
-                assignment.id,
-                assignment.conductor_id,
-                assignment.session_id,
-                assignment.task_ref,
-                assignment.status,
-                assignment.assigned_at,
-                assignment.completed_at,
-            ],
-        )?;
-        let assignment = Self::get_conductor_assignment_in(&tx, &assignment.id)?;
-        tx.commit()?;
-        Ok(assignment)
+        self.with_transaction(|tx| {
+            tx.execute(
+                r#"
+                INSERT INTO conductor_assignments (
+                    id, conductor_id, session_id, task_ref, status, assigned_at, completed_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "#,
+                params![
+                    assignment.id,
+                    assignment.conductor_id,
+                    assignment.session_id,
+                    assignment.task_ref,
+                    assignment.status,
+                    assignment.assigned_at,
+                    assignment.completed_at,
+                ],
+            )?;
+            Self::get_conductor_assignment_in(tx, &assignment.id)
+        })
+    }
+
+    pub fn get_conductor_assignment(&self, id: &str) -> Result<ConductorAssignmentRecord> {
+        let conn = self.connect()?;
+        Self::get_conductor_assignment_in(&conn, id)
+    }
+
+    pub fn update_conductor_assignment(
+        &self,
+        assignment: &ConductorAssignmentRecord,
+    ) -> Result<ConductorAssignmentRecord> {
+        self.with_transaction(|tx| {
+            tx.execute(
+                r#"
+                UPDATE conductor_assignments
+                SET status = ?2,
+                    completed_at = ?3
+                WHERE id = ?1
+                "#,
+                params![assignment.id, assignment.status, assignment.completed_at],
+            )?;
+            Self::get_conductor_assignment_in(tx, &assignment.id)
+        })
     }
 
     pub fn list_conductor_assignments(
@@ -1347,29 +1437,42 @@ impl SessionStore {
             .map_err(Into::into)
     }
 
+    pub fn open_conductor_assignments_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<ConductorAssignmentRecord>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT * FROM conductor_assignments WHERE session_id = ?1 AND completed_at = 0 ORDER BY assigned_at ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], Self::read_conductor_assignment)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn cost_summary(&self, filter: &CostFilter) -> Result<CostSummary> {
         let conn = self.connect()?;
-        let project_root = if let Some(project_id) = filter.project_id.as_deref() {
-            let root = conn
+        let project_id = if let Some(project_id) = filter.project_id.as_deref() {
+            let exists = conn
                 .query_row(
-                    "SELECT root_path FROM projects WHERE id = ?1 AND profile = ?2",
+                    "SELECT 1 FROM projects WHERE id = ?1 AND profile = ?2",
                     params![project_id, filter.profile],
-                    |row| row.get::<_, String>(0),
+                    |row| row.get::<_, i64>(0),
                 )
                 .optional()?;
-            if root.is_none() {
+            if exists.is_none() {
                 return Ok(empty_cost_summary(filter));
             }
-            root
+            Some(project_id.to_string())
         } else {
             None
         };
 
         let mut stmt = conn.prepare(
             r#"
-            SELECT ce.session_id, ce.amount_usd, ce.payload, s.project_path
-            FROM cost_events ce
-            INNER JOIN sessions s ON s.id = ce.session_id
+                SELECT ce.session_id, ce.amount_usd, ce.payload, s.project_id
+                FROM cost_events ce
+                INNER JOIN sessions s ON s.id = ce.session_id
             WHERE s.profile = ?1
               AND ce.created_at >= ?2
               AND ce.created_at <= ?3
@@ -1404,9 +1507,9 @@ impl SessionStore {
         let mut summary = empty_cost_summary(filter);
         let mut sessions = HashSet::new();
         for row in rows {
-            let (session_id, amount_usd, payload, project_path) = row?;
-            if let Some(root) = project_root.as_deref()
-                && project_path != root
+            let (session_id, amount_usd, payload, row_project_id) = row?;
+            if let Some(project_id) = project_id.as_deref()
+                && row_project_id != project_id
             {
                 continue;
             }
@@ -1430,6 +1533,99 @@ impl SessionStore {
         }
         summary.session_count = sessions.len() as i64;
         Ok(summary)
+    }
+
+    pub fn cost_events(
+        &self,
+        filter: &CostFilter,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<CostEvent>> {
+        let limit = limit.min(500);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.connect()?;
+        let project_id = if let Some(project_id) = filter.project_id.as_deref() {
+            let exists = conn
+                .query_row(
+                    "SELECT 1 FROM projects WHERE id = ?1 AND profile = ?2",
+                    params![project_id, filter.profile],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            if exists.is_none() {
+                return Ok(Vec::new());
+            }
+            Some(project_id.to_string())
+        } else {
+            None
+        };
+
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT ce.id, ce.session_id, ce.amount_usd, ce.payload, ce.created_at, s.project_id
+            FROM cost_events ce
+            INNER JOIN sessions s ON s.id = ce.session_id
+            WHERE s.profile = ?1
+              AND ce.created_at >= ?2
+              AND ce.created_at <= ?3
+              AND (?4 IS NULL OR s.group_name = ?4)
+              AND (?5 IS NULL OR ce.session_id = ?5)
+              AND (?6 IS NULL OR s.agent = ?6)
+              AND (?7 = 1 OR s.archived = 0)
+            ORDER BY ce.created_at DESC, ce.id DESC
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![
+                filter.profile,
+                filter.start_at,
+                filter.end_at,
+                filter.group_name.as_deref(),
+                filter.session_id.as_deref(),
+                filter.agent.as_deref(),
+                bool_to_int(filter.include_archived),
+            ],
+            |row| {
+                let payload: String = row.get("payload")?;
+                Ok((
+                    CostEvent {
+                        id: row.get("id")?,
+                        session_id: row.get("session_id")?,
+                        amount_usd: row.get("amount_usd")?,
+                        payload: parse_payload(payload, 3)?,
+                        created_at: row.get("created_at")?,
+                    },
+                    row.get::<_, String>("project_id")?,
+                ))
+            },
+        )?;
+
+        let mut skipped = 0;
+        let mut events = Vec::new();
+        for row in rows {
+            let (event, row_project_id) = row?;
+            if let Some(project_id) = project_id.as_deref()
+                && row_project_id != project_id
+            {
+                continue;
+            }
+            if let Some(model) = filter.model.as_deref()
+                && event.payload.get("model").and_then(Value::as_str) != Some(model)
+            {
+                continue;
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            events.push(event);
+            if events.len() >= limit {
+                break;
+            }
+        }
+        Ok(events)
     }
 
     fn connect(&self) -> Result<Connection> {
@@ -1458,14 +1654,24 @@ impl SessionStore {
         Ok(file)
     }
 
-    fn delete_by_id(&self, table: &str, kind: &str, id: &str) -> Result<()> {
+    fn with_transaction<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
         let _lock = self.lock_profile()?;
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let changed = tx.execute(&format!("DELETE FROM {table} WHERE id = ?1"), params![id])?;
-        ensure_changed(changed, &format!("{kind} not found"), id)?;
+        let result = f(&tx)?;
         tx.commit()?;
-        Ok(())
+        Ok(result)
+    }
+
+    fn delete_by_id(&self, table: &str, kind: &str, id: &str) -> Result<()> {
+        self.with_transaction(|tx| {
+            let changed =
+                tx.execute(&format!("DELETE FROM {table} WHERE id = ?1"), params![id])?;
+            ensure_changed(changed, &format!("{kind} not found"), id)
+        })
     }
 
     fn query_sessions<P>(
@@ -1620,10 +1826,16 @@ impl SessionStore {
             VALUES (
                 lower(hex(randomblob(16))), ?1, ?2, ?3, 0,
                 (SELECT COALESCE(MAX(display_order) + 1, 0) FROM groups WHERE profile = ?1),
-                '{}', 0, ?4, ?4
+                ?5, 0, ?4, ?4
             )
             "#,
-            params![profile, name, default_project_path, now],
+            params![
+                profile,
+                name,
+                default_project_path,
+                now,
+                group_metadata(name)
+            ],
         )?;
         Ok(())
     }
@@ -1663,6 +1875,7 @@ impl SessionStore {
 
     fn read_group(row: &Row<'_>) -> rusqlite::Result<GroupRecord> {
         let collapsed: i64 = row.get("collapsed")?;
+        let metadata: String = row.get("metadata")?;
         Ok(GroupRecord {
             id: row.get("id")?,
             profile: row.get("profile")?,
@@ -1670,7 +1883,11 @@ impl SessionStore {
             default_project_path: row.get("default_project_path")?,
             collapsed: collapsed != 0,
             display_order: row.get("display_order")?,
-            metadata: row.get("metadata")?,
+            metadata: if metadata.trim().is_empty() || metadata.trim() == "{}" {
+                group_metadata(&row.get::<_, String>("name")?)
+            } else {
+                metadata
+            },
             version: row.get("version")?,
             created_at: row.get("created_at")?,
             updated_at: row.get("updated_at")?,
@@ -1860,6 +2077,20 @@ fn bool_to_int(value: bool) -> i64 {
     if value { 1 } else { 0 }
 }
 
+fn group_metadata(name: &str) -> String {
+    let parent = name.rsplit_once('/').map(|(parent, _)| parent);
+    let depth = name
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .count()
+        .saturating_sub(1);
+    json!({
+        "parent": parent,
+        "depth": depth,
+    })
+    .to_string()
+}
+
 fn lock_path(db_path: &Path) -> PathBuf {
     let file_name = db_path
         .file_name()
@@ -1876,7 +2107,14 @@ fn parse_payload(payload: String, column: usize) -> rusqlite::Result<Value> {
 }
 
 fn payload_i64(payload: &Value, key: &str) -> i64 {
-    payload.get(key).and_then(Value::as_i64).unwrap_or(0)
+    payload
+        .get(key)
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+        })
+        .unwrap_or(0)
 }
 
 fn empty_cost_summary(filter: &CostFilter) -> CostSummary {
@@ -2074,6 +2312,23 @@ mod tests {
             completed_at: 0,
         })?;
         assert_eq!(store.list_conductor_assignments("conductor-1")?.len(), 1);
+        assert_eq!(
+            store
+                .open_conductor_assignments_for_session("session-1")?
+                .len(),
+            1
+        );
+        let mut completed_assignment = store.get_conductor_assignment("assignment-1")?;
+        completed_assignment.status = "completed".into();
+        completed_assignment.completed_at = now + 1;
+        let completed_assignment = store.update_conductor_assignment(&completed_assignment)?;
+        assert_eq!(completed_assignment.status, "completed");
+        assert_eq!(
+            store
+                .open_conductor_assignments_for_session("session-1")?
+                .len(),
+            0
+        );
 
         let cost = store.append_cost_event(
             "session-1",
@@ -2088,7 +2343,7 @@ mod tests {
         assert_eq!(cost.payload["source"], "api_key=[REDACTED]");
         let summary = store.cost_summary(&CostFilter {
             profile: "default".into(),
-            project_id: Some(project.id),
+            project_id: Some(project.id.clone()),
             group_name: Some("moved".into()),
             session_id: None,
             agent: Some("codex".into()),
@@ -2101,6 +2356,24 @@ mod tests {
         assert_eq!(summary.event_count, 1);
         assert_eq!(summary.session_count, 1);
         assert_eq!(summary.total_tokens, 30);
+        let events = store.cost_events(
+            &CostFilter {
+                profile: "default".into(),
+                project_id: Some(project.id),
+                group_name: Some("moved".into()),
+                session_id: None,
+                agent: Some("codex".into()),
+                model: Some("gpt-5".into()),
+                start_at: now,
+                end_at: now_ts(),
+                include_archived: false,
+            },
+            0,
+            10,
+        )?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, cost.id);
+        assert_eq!(events[0].payload["source"], "api_key=[REDACTED]");
 
         Ok(())
     }
