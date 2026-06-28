@@ -19,8 +19,8 @@ cargo run -- session start <session-id>
 cargo run -- session remove <session-id>
 cargo run -- session restore <session-id>
 cargo run -- session fork <session-id> --name paused-copy --no-start
-cargo run -- group create api --parent work
-cargo run -- group update work/api --collapsed true
+cargo run -- group create api --parent work --default-working-directory /path/to/repo
+cargo run -- group update work/api --collapsed true --default-working-directory /path/to/repo
 cargo run -- group delete work/api
 cargo run -- costs --group work/api --model claude-sonnet
 ```

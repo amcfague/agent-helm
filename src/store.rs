@@ -474,13 +474,17 @@ impl SessionStore {
     ) -> Result<SessionRecord> {
         self.with_transaction(|tx| {
             let current = Self::get_session_in(tx, id)?;
-            Self::ensure_group_in(
-                tx,
-                &current.profile,
-                group_name,
-                &current.project_path,
-                now_ts(),
-            )?;
+            let exists = tx
+                .query_row(
+                    "SELECT 1 FROM groups WHERE profile = ?1 AND name = ?2",
+                    params![current.profile, group_name],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .is_some();
+            if !exists {
+                return Err(AppError::msg(format!("group not found: {group_name}")));
+            }
             let changed = tx.execute(
                 r#"
                 UPDATE sessions
@@ -1654,10 +1658,7 @@ impl SessionStore {
         Ok(file)
     }
 
-    fn with_transaction<T>(
-        &self,
-        f: impl FnOnce(&Connection) -> Result<T>,
-    ) -> Result<T> {
+    fn with_transaction<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         let _lock = self.lock_profile()?;
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
@@ -1668,8 +1669,7 @@ impl SessionStore {
 
     fn delete_by_id(&self, table: &str, kind: &str, id: &str) -> Result<()> {
         self.with_transaction(|tx| {
-            let changed =
-                tx.execute(&format!("DELETE FROM {table} WHERE id = ?1"), params![id])?;
+            let changed = tx.execute(&format!("DELETE FROM {table} WHERE id = ?1"), params![id])?;
             ensure_changed(changed, &format!("{kind} not found"), id)
         })
     }
@@ -2162,6 +2162,11 @@ mod tests {
             updated_at: now,
         })?;
         assert_eq!(store.list_groups("default")?[0].name, "group");
+        let missing = store
+            .update_session_group("session-1", 0, "moved")
+            .unwrap_err();
+        assert!(missing.to_string().contains("group not found: moved"));
+        store.create_group("default", "moved", "")?;
         let moved = store.update_session_group("session-1", 0, "moved")?;
         assert_eq!(moved.group_name, "moved");
         assert_eq!(

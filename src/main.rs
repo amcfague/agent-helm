@@ -367,14 +367,14 @@ enum GroupCommand {
         name: String,
         #[arg(long)]
         parent: Option<String>,
-        #[arg(long)]
+        #[arg(long, visible_alias = "default-working-directory")]
         default_project_path: Option<String>,
     },
     Update {
         group: String,
-        #[arg(long)]
+        #[arg(long, visible_alias = "default-working-directory")]
         default_project_path: Option<String>,
-        #[arg(long)]
+        #[arg(long, visible_alias = "clear-default-working-directory")]
         clear_default_project_path: bool,
         #[arg(long)]
         collapsed: Option<bool>,
@@ -1160,9 +1160,6 @@ fn run_command(
                         TuiAction::Restore(session) => {
                             action_controller.restore_session(&session)?;
                         }
-                        TuiAction::SyncState(session) => {
-                            action_controller.sync_agent_state(&session)?;
-                        }
                         TuiAction::Search { query, limit } => {
                             let response = action_controller.search_sessions(&query, limit)?;
                             let mut sessions = Vec::new();
@@ -1180,6 +1177,16 @@ fn run_command(
                                 }
                             }
                             return Ok(sessions);
+                        }
+                        TuiAction::CreateGroup {
+                            name,
+                            default_project_path,
+                        } => {
+                            action_controller.create_group(
+                                name,
+                                None,
+                                Some(default_project_path),
+                            )?;
                         }
                         TuiAction::Remove { session_id, mode } => {
                             action_controller.delete_session(DeleteSessionRequest {
@@ -1205,9 +1212,6 @@ fn run_command(
                             group_name,
                         } => {
                             action_controller.move_session_to_group(&session_id, group_name)?;
-                        }
-                        TuiAction::Send { session_id, text } => {
-                            action_controller.send(&session_id, &text)?;
                         }
                         TuiAction::SaveToolSettings(settings) => {
                             let tools = settings

@@ -842,6 +842,7 @@ pre { margin: 0; padding: 10px; border: 1px solid var(--border); border-radius: 
 <span id="agent-profile-summary" class="muted"></span>
 <input name="group_name" placeholder="Group" value="default">
 <input name="path" placeholder="Project path" value=".">
+<label class="muted"><input name="save_group_default" type="checkbox"> Save group default</label>
 <label class="muted"><input id="new-worktree" name="use_worktree" type="checkbox"> Worktree</label>
 <label class="muted"><input name="carry_state" type="checkbox"> Copy to current state</label>
 <button class="primary" type="submit">New Session</button>
@@ -881,12 +882,12 @@ pre { margin: 0; padding: 10px; border: 1px solid var(--border); border-radius: 
 <form id="group-create-form" style="grid-template-columns: repeat(3, minmax(0, 1fr)) auto">
 <input name="name" placeholder="New group">
 <input name="parent" placeholder="Parent group">
-<input name="default_project_path" placeholder="Default project path">
+<input name="default_project_path" placeholder="Default working directory">
 <button type="submit">Create Group</button>
 </form>
 <form id="group-update-form" style="grid-template-columns: repeat(4, minmax(0, 1fr)) auto">
 <input name="name" placeholder="Update group">
-<input name="default_project_path" placeholder="Default project path">
+<input name="default_project_path" placeholder="Default working directory">
 <label class="muted"><input name="clear_default_project_path" type="checkbox"> Clear path</label>
 <select name="collapsed">
 <option value="">Collapse</option>
@@ -2202,15 +2203,20 @@ if (!canWrite()) return;
   const form = new FormData(event.target);
   const data = Object.fromEntries(form);
   const nameInput = event.target.elements.name;
-  data.name = data.name.trim() || nameInput.dataset.defaultName || "web-session";
-  data.carry_state = form.has("carry_state");
+data.name = data.name.trim() || nameInput.dataset.defaultName || "web-session";
+data.carry_state = form.has("carry_state");
 data.sandbox = false;
+const saveGroupDefault = form.has("save_group_default");
+delete data.save_group_default;
 delete data.use_worktree;
 if (form.has("use_worktree")) {
 data.worktree = generatedWorktreeBranch(data.agent, data.name, data.path);
 }
 try {
 const session = await api("/api/sessions", {method: "POST", body: JSON.stringify(data)});
+if (saveGroupDefault) {
+await api(`/api/groups/${data.group_name}`, {method: "PATCH", body: JSON.stringify({default_project_path: data.path})});
+}
 selectSession(session);
 await loadSessions();
 await loadPanel();

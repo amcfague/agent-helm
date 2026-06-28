@@ -398,10 +398,13 @@ pub enum TuiAction {
     Fork(ForkSessionRequest),
     Archive(String),
     Restore(String),
-    SyncState(String),
     Search {
         query: String,
         limit: usize,
+    },
+    CreateGroup {
+        name: String,
+        default_project_path: String,
     },
     Remove {
         session_id: String,
@@ -415,10 +418,6 @@ pub enum TuiAction {
     MoveToGroup {
         session_id: String,
         group_name: String,
-    },
-    Send {
-        session_id: String,
-        text: String,
     },
     SaveToolSettings(Vec<ToolLaunchSettings>),
 }
@@ -555,6 +554,7 @@ where
 struct App {
     sessions: Vec<SessionRecord>,
     collapsed_groups: BTreeSet<String>,
+    group_default_paths: BTreeMap<String, String>,
     deck_statuses: BTreeMap<String, TuiSessionStatus>,
     details: TuiDetails,
     details_session_id: Option<String>,
@@ -584,14 +584,18 @@ struct App {
 fn app_from_initial(initial: TuiInitialState) -> App {
     let agent_choices = normalize_agent_choices(initial.agent_choices);
     let default_agent = normalized_agent(&initial.default_agent);
+    let mut collapsed_groups = BTreeSet::new();
+    let mut group_default_paths = BTreeMap::new();
+    for group in initial.groups {
+        if group.collapsed {
+            collapsed_groups.insert(group.name.clone());
+        }
+        group_default_paths.insert(group.name, group.default_project_path);
+    }
     App {
         sessions: initial.sessions,
-        collapsed_groups: initial
-            .groups
-            .into_iter()
-            .filter(|group| group.collapsed)
-            .map(|group| group.name)
-            .collect(),
+        collapsed_groups,
+        group_default_paths,
         deck_statuses: BTreeMap::new(),
         details: TuiDetails::default(),
         details_session_id: None,
@@ -1380,8 +1384,8 @@ enum Mode {
     Normal,
     Search,
     New(NewForm),
+    CreateGroup(GroupForm),
     Fork(ForkForm),
-    Send(SendForm),
     Session(SendForm),
     Move(MoveForm),
     ToolSettings(ToolSettingsForm),
@@ -1405,6 +1409,66 @@ impl MoveForm {
             session_id: session.id.clone(),
             group_name: session.group_name.clone(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupField {
+    Name,
+    DefaultPath,
+}
+
+const GROUP_FIELDS: [GroupField; 2] = [GroupField::Name, GroupField::DefaultPath];
+
+impl GroupField {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Name => "Name",
+            Self::DefaultPath => "Default working dir",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GroupForm {
+    name: String,
+    default_project_path: String,
+    field_index: usize,
+}
+
+impl GroupForm {
+    fn new() -> Self {
+        Self {
+            name: String::new(),
+            default_project_path: default_new_session_path(),
+            field_index: 0,
+        }
+    }
+
+    fn current_field(&self) -> GroupField {
+        GROUP_FIELDS[self.field_index]
+    }
+
+    fn current_value_mut(&mut self) -> &mut String {
+        match self.current_field() {
+            GroupField::Name => &mut self.name,
+            GroupField::DefaultPath => &mut self.default_project_path,
+        }
+    }
+
+    fn field_value(&self, field: GroupField) -> &str {
+        match field {
+            GroupField::Name => &self.name,
+            GroupField::DefaultPath => &self.default_project_path,
+        }
+    }
+
+    fn next_field(&mut self) {
+        self.field_index = (self.field_index + 1).min(GROUP_FIELDS.len() - 1);
+    }
+
+    fn previous_field(&mut self) {
+        self.field_index = self.field_index.saturating_sub(1);
     }
 }
 
@@ -1616,6 +1680,10 @@ impl NewField {
             Self::CarryState => "Copy current state",
         }
     }
+
+    fn is_text_entry(self) -> bool {
+        matches!(self, Self::Name | Self::Path)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1671,8 +1739,7 @@ impl NewForm {
         match self.current_field() {
             NewField::Name => Some(&mut self.name),
             NewField::Path => Some(&mut self.path),
-            NewField::Group => Some(&mut self.group_name),
-            NewField::Agent | NewField::Worktree | NewField::CarryState => None,
+            NewField::Agent | NewField::Group | NewField::Worktree | NewField::CarryState => None,
         }
     }
 
@@ -1760,14 +1827,71 @@ impl NewForm {
 
 fn new_form_for_agent(app: &App, agent: &str) -> NewForm {
     let mut form = NewForm::with_agent(agent);
+    select_existing_group(&mut form.group_name, &app.group_default_paths);
+    apply_group_default_path(&mut form, &app.group_default_paths);
     form.worktree = tool_creates_worktree_by_default(&app.tool_settings, &form.agent);
     form
 }
 
 fn new_form_for_session(app: &App, session: &SessionSummary) -> NewForm {
     let mut form = NewForm::for_session(session);
+    select_existing_group(&mut form.group_name, &app.group_default_paths);
     form.worktree = tool_creates_worktree_by_default(&app.tool_settings, &form.agent);
     form
+}
+
+fn group_default_path<'a>(
+    group_default_paths: &'a BTreeMap<String, String>,
+    group_name: &str,
+) -> Option<&'a str> {
+    group_default_paths
+        .get(group_name.trim())
+        .map(String::as_str)
+        .filter(|path| !path.trim().is_empty())
+}
+
+fn group_names(group_default_paths: &BTreeMap<String, String>) -> Vec<String> {
+    group_default_paths.keys().cloned().collect()
+}
+
+fn select_existing_group(group_name: &mut String, group_default_paths: &BTreeMap<String, String>) {
+    if group_default_paths.contains_key(group_name.trim()) {
+        return;
+    }
+    *group_name = group_default_paths
+        .keys()
+        .next()
+        .cloned()
+        .unwrap_or_default();
+}
+
+fn cycle_group_name(
+    group_name: &mut String,
+    group_default_paths: &BTreeMap<String, String>,
+    delta: isize,
+) {
+    let groups = group_names(group_default_paths);
+    if groups.is_empty() {
+        group_name.clear();
+        return;
+    }
+    let current = groups
+        .iter()
+        .position(|group| group == group_name)
+        .unwrap_or(0);
+    let next = (current as isize + delta).rem_euclid(groups.len() as isize) as usize;
+    *group_name = groups[next].clone();
+}
+
+fn apply_group_default_path(
+    form: &mut NewForm,
+    group_default_paths: &BTreeMap<String, String>,
+) -> bool {
+    let Some(path) = group_default_path(group_default_paths, &form.group_name) else {
+        return false;
+    };
+    form.path = path.to_string();
+    true
 }
 
 fn normalized_agent(agent: &str) -> String {
@@ -2003,6 +2127,7 @@ where
     refresh_details(app, load_details, true)?;
     let preview_worker = PreviewWorker::spawn();
     let mut tui_loop = TuiLoop::new(Instant::now());
+    let mut mouse_capture_enabled = true;
     loop {
         let now = Instant::now();
         if tui_loop.should_refresh_sessions(now) {
@@ -2017,6 +2142,13 @@ where
             tui_loop.mark_animated(Instant::now());
         }
 
+        if sync_mouse_capture(
+            terminal,
+            &mut mouse_capture_enabled,
+            should_capture_mouse(&app.mode),
+        )? {
+            tui_loop.mark_changed();
+        }
         if sync_embedded_tmux(terminal, app) {
             tui_loop.mark_changed();
         }
@@ -2038,7 +2170,7 @@ where
 
         match event::read()? {
             Event::Key(key) => {
-                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                if is_global_quit_key(key, &app.mode) {
                     return Ok(());
                 }
 
@@ -2287,6 +2419,27 @@ fn tmux_target_for_session(session: &SessionSummary) -> String {
         .unwrap_or_else(|| tmux_session_name_for_id(&session.id))
 }
 
+fn should_capture_mouse(mode: &Mode) -> bool {
+    !matches!(mode, Mode::Session(_))
+}
+
+fn sync_mouse_capture(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    mouse_capture_enabled: &mut bool,
+    should_enable: bool,
+) -> Result<bool> {
+    if *mouse_capture_enabled == should_enable {
+        return Ok(false);
+    }
+    if should_enable {
+        execute!(terminal.backend_mut(), EnableMouseCapture)?;
+    } else {
+        execute!(terminal.backend_mut(), DisableMouseCapture)?;
+    }
+    *mouse_capture_enabled = should_enable;
+    Ok(true)
+}
+
 fn process_key<F>(
     _terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
@@ -2307,14 +2460,22 @@ where
         }
         Mode::Search => handle_search_key(key, app, handle_action)?,
         Mode::New(_) => handle_new_key(key, app, handle_action)?,
+        Mode::CreateGroup(_) => handle_create_group_key(key, app, handle_action)?,
         Mode::Fork(_) => handle_fork_key(key, app, handle_action)?,
-        Mode::Send(_) => handle_send_key(key, app, handle_action)?,
         Mode::Session(_) => handle_session_key(key, app)?,
         Mode::Move(_) => handle_move_key(key, app, handle_action)?,
         Mode::ToolSettings(_) => handle_tool_settings_key(key, app, handle_action)?,
         Mode::Help => handle_help_key(key, app),
     }
     Ok(false)
+}
+
+fn is_plain_ctrl_key(key: KeyEvent, ch: char) -> bool {
+    key.code == KeyCode::Char(ch) && key.modifiers == KeyModifiers::CONTROL
+}
+
+fn is_global_quit_key(key: KeyEvent, mode: &Mode) -> bool {
+    is_plain_ctrl_key(key, 'c') && !matches!(mode, Mode::Session(_))
 }
 
 fn process_mouse(app: &mut App, mouse: MouseEvent, area: Rect) -> bool {
@@ -2556,6 +2717,10 @@ where
         KeyCode::Char('c') => toggle_selected_group(app, handle_action)?,
         KeyCode::Char('e') => expand_groups(app, handle_action)?,
         KeyCode::Char('g') => open_tool_settings(app),
+        KeyCode::Char('G') => {
+            app.mode = Mode::CreateGroup(GroupForm::new());
+            app.status_message = None;
+        }
         KeyCode::Char('t') => {
             app.status_filter = app.status_filter.next();
             app.selected_index = 0;
@@ -2576,12 +2741,6 @@ where
             app.mode = Mode::New(new_form_for_agent(app, &app.last_agent));
             app.status_message = None;
         }
-        KeyCode::Char('s') => {
-            if selected_id(app).is_some() {
-                app.mode = Mode::Send(SendForm::default());
-                app.status_message = None;
-            }
-        }
         KeyCode::Char('m') => {
             if let Some(session) = app.view().selected {
                 app.mode = Mode::Move(MoveForm::for_session(&session));
@@ -2590,7 +2749,6 @@ where
                 app.status_message = Some("no session selected".to_string());
             }
         }
-        KeyCode::Char('x') => run_selected_action(app, handle_action, TuiAction::Stop, "stopped")?,
         KeyCode::Char('r') => {
             run_selected_action(app, handle_action, TuiAction::Restart, "restarted")?
         }
@@ -2600,36 +2758,6 @@ where
                 app.status_message = None;
             }
         }
-        KeyCode::Char('d') => {
-            run_selected_action(app, handle_action, TuiAction::Archive, "archived")?
-        }
-        KeyCode::Char('u') => {
-            run_selected_action(app, handle_action, TuiAction::Restore, "restored")?
-        }
-        KeyCode::Char('S') => run_selected_action_refreshing_details(
-            app,
-            handle_action,
-            TuiAction::SyncState,
-            "synced state",
-        )?,
-        KeyCode::Delete if key.modifiers.contains(KeyModifiers::SHIFT) => run_selected_action(
-            app,
-            handle_action,
-            |session_id| TuiAction::Remove {
-                session_id,
-                mode: DeleteMode::CleanupWorktree,
-            },
-            "removed",
-        )?,
-        KeyCode::Delete => run_selected_action(
-            app,
-            handle_action,
-            |session_id| TuiAction::Remove {
-                session_id,
-                mode: DeleteMode::MetadataOnly,
-            },
-            "removed",
-        )?,
         KeyCode::PageDown => app.detail_scroll = app.detail_scroll.saturating_add(5),
         KeyCode::PageUp => app.detail_scroll = app.detail_scroll.saturating_sub(5),
         KeyCode::Down | KeyCode::Char('j') => {
@@ -2817,12 +2945,33 @@ where
     let mut submit = false;
     let agent_choices = app.agent_choices.clone();
     let tool_settings = app.tool_settings.clone();
+    let group_default_paths = app.group_default_paths.clone();
 
     if let Mode::New(form) = &mut app.mode {
         match key.code {
             KeyCode::Esc => app.mode = Mode::Normal,
-            KeyCode::Tab | KeyCode::Down => form.next_field(),
-            KeyCode::BackTab | KeyCode::Up => form.previous_field(),
+            KeyCode::Tab | KeyCode::Down => {
+                let apply_group_path = form.current_field() == NewField::Group;
+                form.next_field();
+                if apply_group_path {
+                    apply_group_default_path(form, &group_default_paths);
+                }
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                let apply_group_path = form.current_field() == NewField::Group;
+                form.previous_field();
+                if apply_group_path {
+                    apply_group_default_path(form, &group_default_paths);
+                }
+            }
+            KeyCode::Left if form.current_field() == NewField::Group => {
+                cycle_group_name(&mut form.group_name, &group_default_paths, -1);
+                apply_group_default_path(form, &group_default_paths);
+            }
+            KeyCode::Right if form.current_field() == NewField::Group => {
+                cycle_group_name(&mut form.group_name, &group_default_paths, 1);
+                apply_group_default_path(form, &group_default_paths);
+            }
             KeyCode::Left if form.current_field() == NewField::Agent => {
                 form.cycle_agent(&agent_choices, -1);
                 form.worktree = tool_creates_worktree_by_default(&tool_settings, &form.agent);
@@ -2832,10 +2981,14 @@ where
                 form.worktree = tool_creates_worktree_by_default(&tool_settings, &form.agent);
             }
             KeyCode::Enter => {
+                let apply_group_path = form.current_field() == NewField::Group;
                 if form.field_index == NEW_FIELDS.len() - 1 {
                     submit = true;
                 } else {
                     form.next_field();
+                }
+                if apply_group_path {
+                    apply_group_default_path(form, &group_default_paths);
                 }
             }
             KeyCode::Backspace => {
@@ -2844,7 +2997,14 @@ where
                 }
             }
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if form.current_field() == NewField::Group {
+                    apply_group_default_path(form, &group_default_paths);
+                }
                 submit = true;
+            }
+            KeyCode::Char(' ') if form.current_field() == NewField::Group => {
+                cycle_group_name(&mut form.group_name, &group_default_paths, 1);
+                apply_group_default_path(form, &group_default_paths);
             }
             KeyCode::Char(' ') if form.current_field() == NewField::Agent => {
                 form.cycle_agent(&agent_choices, 1);
@@ -2902,6 +3062,72 @@ where
         }
     }
 
+    Ok(())
+}
+
+fn handle_create_group_key<F>(key: KeyEvent, app: &mut App, handle_action: &mut F) -> Result<()>
+where
+    F: FnMut(TuiAction) -> Result<Vec<SessionRecord>>,
+{
+    let mut submit = false;
+    if let Mode::CreateGroup(form) = &mut app.mode {
+        match key.code {
+            KeyCode::Esc => app.mode = Mode::Normal,
+            KeyCode::Tab | KeyCode::Down => form.next_field(),
+            KeyCode::BackTab | KeyCode::Up => form.previous_field(),
+            KeyCode::Enter => {
+                if form.field_index == GROUP_FIELDS.len() - 1 {
+                    submit = true;
+                } else {
+                    form.next_field();
+                }
+            }
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                submit = true;
+            }
+            KeyCode::Backspace => {
+                form.current_value_mut().pop();
+            }
+            KeyCode::Char(ch) => {
+                form.current_value_mut().push(ch);
+            }
+            _ => {}
+        }
+    }
+
+    if submit {
+        let (name, default_project_path) = match &app.mode {
+            Mode::CreateGroup(form) => (
+                form.name.trim().to_string(),
+                form.default_project_path.trim().to_string(),
+            ),
+            _ => return Ok(()),
+        };
+        if name.is_empty() {
+            app.status_message = Some("group name required".to_string());
+            return Ok(());
+        }
+        if app.group_default_paths.contains_key(&name) {
+            app.status_message = Some("group already exists".to_string());
+            return Ok(());
+        }
+
+        match handle_action(TuiAction::CreateGroup {
+            name: name.clone(),
+            default_project_path: default_project_path.clone(),
+        }) {
+            Ok(sessions) => {
+                app.group_default_paths
+                    .insert(name.clone(), default_project_path);
+                app.sessions = sessions;
+                app.mode = Mode::Normal;
+                app.status_message = Some(format!("created group {name}"));
+            }
+            Err(err) => {
+                app.status_message = Some(format!("create group failed: {err}"));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2996,52 +3222,8 @@ fn select_matching_session(app: &mut App, matches: impl FnMut(&SessionSummary) -
     }
 }
 
-fn handle_send_key<F>(key: KeyEvent, app: &mut App, handle_action: &mut F) -> Result<()>
-where
-    F: FnMut(TuiAction) -> Result<Vec<SessionRecord>>,
-{
-    let mut submit = false;
-    if let Mode::Send(form) = &mut app.mode {
-        match key.code {
-            KeyCode::Esc => app.mode = Mode::Normal,
-            KeyCode::Enter => submit = true,
-            KeyCode::Backspace => {
-                form.text.pop();
-            }
-            KeyCode::Char(ch) => form.text.push(ch),
-            _ => {}
-        }
-    }
-    if submit {
-        let text = match &app.mode {
-            Mode::Send(form) => form.text.trim().to_string(),
-            _ => String::new(),
-        };
-        if text.is_empty() {
-            app.status_message = Some("send text required".to_string());
-            return Ok(());
-        }
-        let Some(session_id) = selected_id(app) else {
-            app.status_message = Some("no session selected".to_string());
-            return Ok(());
-        };
-        let selected_session_id = session_id.clone();
-        match handle_action(TuiAction::Send { session_id, text }) {
-            Ok(sessions) => {
-                app.sessions = sessions;
-                invalidate_session_cache(app, &selected_session_id);
-                app.mode = Mode::Normal;
-                app.status_message = Some("sent input".to_string());
-            }
-            Err(err) => app.status_message = Some(format!("send failed: {err}")),
-        }
-    }
-    Ok(())
-}
-
 fn handle_session_key(key: KeyEvent, app: &mut App) -> Result<()> {
-    let is_ctrl_q = key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL);
-    if is_ctrl_q {
+    if is_plain_ctrl_key(key, 'q') {
         app.embedded = None;
         app.mode = Mode::Normal;
         app.status_message = Some("returned to dashboard".to_string());
@@ -3078,6 +3260,10 @@ where
         };
         if group_name.is_empty() {
             app.status_message = Some("group is required".to_string());
+            return Ok(());
+        }
+        if !app.group_default_paths.contains_key(&group_name) {
+            app.status_message = Some("group must already exist".to_string());
             return Ok(());
         }
 
@@ -3192,23 +3378,6 @@ where
             app.status_message = Some(done.to_string());
         }
         Err(err) => app.status_message = Some(format!("{done} failed: {err}")),
-    }
-    Ok(())
-}
-
-fn run_selected_action_refreshing_details<F, M>(
-    app: &mut App,
-    handle_action: &mut F,
-    build: M,
-    done: &str,
-) -> Result<()>
-where
-    F: FnMut(TuiAction) -> Result<Vec<SessionRecord>>,
-    M: FnOnce(String) -> TuiAction,
-{
-    run_selected_action(app, handle_action, build, done)?;
-    if app.status_message.as_deref() == Some(done) {
-        app.details_session_id = None;
     }
     Ok(())
 }
@@ -3347,12 +3516,18 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     frame.render_stateful_widget(sessions, body.sidebar, &mut session_state);
     frame.render_widget(divider(app.resizing_sidebar), body.divider);
     match &app.mode {
-        Mode::New(form) => frame.render_widget(
-            create_form(form, &app.agent_choices, &app.status_message),
+        Mode::New(form) => render_create_form(
+            frame,
+            form,
+            &app.agent_choices,
+            &app.group_default_paths,
+            &app.status_message,
             body.detail,
         ),
+        Mode::CreateGroup(form) => {
+            frame.render_widget(create_group_form(form, &app.status_message), body.detail)
+        }
         Mode::Fork(form) => frame.render_widget(fork_form(form, &app.status_message), body.detail),
-        Mode::Send(form) => frame.render_widget(send_form(form, &app.status_message), body.detail),
         Mode::Session(_) => render_session_terminal(frame, app, &view, body.detail),
         Mode::Move(form) => frame.render_widget(move_form(form, &app.status_message), body.detail),
         Mode::ToolSettings(form) => {
@@ -3365,6 +3540,23 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         _ => render_dashboard_detail(frame, app, &view, body.detail),
     }
     frame.render_widget(footer(app), chunks[2]);
+}
+
+fn render_create_form(
+    frame: &mut Frame<'_>,
+    form: &NewForm,
+    agent_choices: &[String],
+    group_default_paths: &BTreeMap<String, String>,
+    status_message: &Option<String>,
+    area: Rect,
+) {
+    frame.render_widget(
+        create_form(form, agent_choices, group_default_paths, status_message),
+        area,
+    );
+    if let Some((x, y)) = new_form_cursor_position(form, area) {
+        frame.set_cursor_position((x, y));
+    }
 }
 
 fn tool_settings_popup_area(area: Rect) -> Rect {
@@ -3629,10 +3821,8 @@ fn help_panel() -> Paragraph<'static> {
         Line::from("Enter focuses embedded session viewport | Ctrl-q returns"),
         Line::from(""),
         section_line("Actions"),
-        Line::from("n new session | Ctrl-n shell | N duplicate | s send input | m move group"),
-        Line::from("S sync state | r restart | x stop | f fork | d archive | u restore"),
-        Line::from("Del remove | Shift+Del cleanup"),
-        Line::from("g opens profile tool settings"),
+        Line::from("n new session | Ctrl-n shell | N duplicate | m move group"),
+        Line::from("r restart | f fork | g opens profile tool settings"),
         Line::from(""),
         section_line("Filters"),
         Line::from("/ search | a toggle archived | t status filter | PageUp/PageDown scroll"),
@@ -4022,9 +4212,97 @@ fn agent_selector_spans(form: &NewForm, agent_choices: &[String]) -> Vec<Span<'s
     spans
 }
 
+fn group_selector_spans(
+    form: &NewForm,
+    group_default_paths: &BTreeMap<String, String>,
+) -> Vec<Span<'static>> {
+    let groups = group_names(group_default_paths);
+    if groups.is_empty() {
+        return vec![Span::styled("no groups", muted_style())];
+    }
+
+    let mut spans = Vec::new();
+    for (index, group) in groups.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let selected = group == &form.group_name;
+        let label = if selected {
+            format!("[{group}]")
+        } else {
+            group.to_string()
+        };
+        let style = if selected {
+            title_style().add_modifier(Modifier::BOLD)
+        } else {
+            muted_style()
+        };
+        spans.push(Span::styled(label, style));
+    }
+    spans
+}
+
+fn text_entry_style(active: bool, placeholder: bool) -> Style {
+    let style = if placeholder {
+        muted_style()
+    } else {
+        Style::default()
+    };
+    if active {
+        style.bg(Color::Rgb(31, 36, 49))
+    } else {
+        style
+    }
+}
+
+fn text_entry_spans(form: &NewForm, field: NewField, active: bool) -> Vec<Span<'static>> {
+    let value = form.field_value(field);
+    let placeholder = field == NewField::Name && value.trim().is_empty();
+    let display = if placeholder {
+        form.default_name()
+    } else {
+        value.to_string()
+    };
+    let border_style = if active {
+        active_border_style().add_modifier(Modifier::BOLD)
+    } else {
+        border_style()
+    };
+    let value_style = text_entry_style(active, placeholder);
+    vec![
+        Span::styled("[", border_style),
+        Span::styled(" ", value_style),
+        Span::styled(display, value_style),
+        Span::styled(" ", value_style),
+        Span::styled("]", border_style),
+    ]
+}
+
+fn new_form_cursor_position(form: &NewForm, area: Rect) -> Option<(u16, u16)> {
+    let field = form.current_field();
+    if !field.is_text_entry() || area.width < 4 || area.height < 3 {
+        return None;
+    }
+
+    let row = area.y.saturating_add(1 + form.field_index as u16);
+    if row >= area.y.saturating_add(area.height).saturating_sub(1) {
+        return None;
+    }
+
+    let value_width = form
+        .field_value(field)
+        .chars()
+        .count()
+        .min(u16::MAX as usize) as u16;
+    let x = area.x.saturating_add(24).saturating_add(value_width);
+    let max_x = area.x.saturating_add(area.width).saturating_sub(2);
+    Some((x.min(max_x), row))
+}
+
 fn create_form(
     form: &NewForm,
     agent_choices: &[String],
+    group_default_paths: &BTreeMap<String, String>,
     status_message: &Option<String>,
 ) -> Paragraph<'static> {
     let mut lines = Vec::new();
@@ -4044,10 +4322,9 @@ fn create_form(
             Span::raw(" "),
         ];
         match field {
-            NewField::Name if form.name.trim().is_empty() => {
-                spans.push(Span::styled(form.default_name(), muted_style()));
-            }
+            field if field.is_text_entry() => spans.extend(text_entry_spans(form, field, active)),
             NewField::Agent => spans.extend(agent_selector_spans(form, agent_choices)),
+            NewField::Group => spans.extend(group_selector_spans(form, group_default_paths)),
             NewField::Worktree => {
                 let checkbox = if form.worktree { "[x]" } else { "[ ]" };
                 spans.push(Span::raw(checkbox));
@@ -4071,6 +4348,48 @@ fn create_form(
 
     Paragraph::new(lines)
         .block(panel_block("NEW SESSION"))
+        .wrap(Wrap { trim: false })
+}
+
+fn create_group_form(form: &GroupForm, status_message: &Option<String>) -> Paragraph<'static> {
+    let mut lines = Vec::new();
+    for field in GROUP_FIELDS {
+        let active = field == form.current_field();
+        let marker = if active { ">" } else { " " };
+        let style = if active {
+            title_style()
+        } else {
+            Style::default()
+        };
+        let border_style = if active {
+            active_border_style().add_modifier(Modifier::BOLD)
+        } else {
+            border_style()
+        };
+        let value_style = text_entry_style(active, false);
+        lines.push(Line::from(vec![
+            Span::styled(marker, style),
+            Span::raw(" "),
+            Span::styled(format!("{:<18}", field.label()), style),
+            Span::raw(" "),
+            Span::styled("[", border_style),
+            Span::styled(" ", value_style),
+            Span::styled(form.field_value(field).to_string(), value_style),
+            Span::styled(" ", value_style),
+            Span::styled("]", border_style),
+        ]));
+    }
+
+    if let Some(message) = status_message {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            message.clone(),
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    Paragraph::new(lines)
+        .block(panel_block("CREATE GROUP"))
         .wrap(Wrap { trim: false })
 }
 
@@ -4203,24 +4522,6 @@ fn fork_form(form: &ForkForm, status_message: &Option<String>) -> Paragraph<'sta
         .wrap(Wrap { trim: false })
 }
 
-fn send_form(form: &SendForm, status_message: &Option<String>) -> Paragraph<'static> {
-    let mut lines = vec![Line::from(vec![
-        Span::styled(">", title_style()),
-        Span::raw(" Text     "),
-        Span::raw(form.text.clone()),
-    ])];
-    if let Some(message) = status_message {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            message.clone(),
-            Style::default().fg(Color::Red),
-        )));
-    }
-    Paragraph::new(lines)
-        .block(panel_block("SEND INPUT"))
-        .wrap(Wrap { trim: false })
-}
-
 fn move_form(form: &MoveForm, status_message: &Option<String>) -> Paragraph<'static> {
     let mut lines = vec![Line::from(vec![
         Span::styled(">", title_style()),
@@ -4250,8 +4551,10 @@ fn footer_text(app: &App) -> String {
         Mode::New(_) => {
             "New: Tab field | Enter next/create | Ctrl-S create | Esc cancel".to_string()
         }
+        Mode::CreateGroup(_) => {
+            "Create group: Tab field | Enter next/create | Ctrl-S create | Esc cancel".to_string()
+        }
         Mode::Fork(_) => "Fork: Tab field | Enter next/fork | Ctrl-S fork | Esc cancel".to_string(),
-        Mode::Send(_) => "Send: type input | Enter send | Esc cancel".to_string(),
         Mode::Session(_) => "Session: interactive tmux viewport | Ctrl-q dashboard".to_string(),
         Mode::Move(_) => "Move: type group | Enter move | Esc cancel".to_string(),
         Mode::ToolSettings(_) => {
@@ -4259,7 +4562,7 @@ fn footer_text(app: &App) -> String {
         }
         Mode::Help => "Help: Esc/q close".to_string(),
         Mode::Normal => {
-                "Enter session s send S sync m move r restart f fork x stop d/u archive/restore Del remove Shift+Del cleanup | n new Ctrl-n shell N duplicate | g tools | j/k nav c/e groups Pg scroll / search a archived t status ? help q quit".to_string()
+            "Enter session m move r restart f fork | n new Ctrl-n shell N duplicate | g tools | j/k nav c/e groups Pg scroll / search a archived t status ? help q quit".to_string()
         }
     }
 }
@@ -4797,6 +5100,7 @@ mod tests {
         let mut app = App {
             sessions: vec![record("1", "ops", "deploy", false)],
             collapsed_groups: BTreeSet::new(),
+            group_default_paths: BTreeMap::new(),
             deck_statuses: BTreeMap::new(),
             details: TuiDetails::default(),
             details_session_id: None,
@@ -5113,6 +5417,97 @@ mod tests {
     }
 
     #[test]
+    fn new_form_uses_default_group_path() {
+        let mut app = app_from_initial(TuiInitialState {
+            sessions: vec![],
+            groups: vec![group_record("default", "/tmp/default", false)],
+            default_agent: "shell".to_string(),
+            headroom_metrics: None,
+            agent_choices: default_agent_choices(),
+            tool_settings: normalize_tool_settings(Vec::new()),
+        });
+        let mut handle = |_action| Ok(Vec::new());
+
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut app,
+            &mut handle,
+        )
+        .unwrap();
+
+        let Mode::New(form) = &app.mode else {
+            panic!("expected new form");
+        };
+        assert_eq!(form.path, "/tmp/default");
+    }
+
+    #[test]
+    fn new_form_applies_group_path_when_leaving_group_field() {
+        let mut app = test_app(vec![]);
+        app.group_default_paths
+            .insert("work/api".to_string(), "/tmp/api".to_string());
+        app.mode = Mode::New(NewForm {
+            path: "/tmp/original".to_string(),
+            group_name: "work/api".to_string(),
+            field_index: 3,
+            ..NewForm::default()
+        });
+        let mut handle = |_action| Ok(Vec::new());
+
+        handle_new_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            &mut handle,
+        )
+        .unwrap();
+
+        let Mode::New(form) = &app.mode else {
+            panic!("expected new form");
+        };
+        assert_eq!(form.path, "/tmp/api");
+        assert_eq!(form.current_field(), NewField::Worktree);
+    }
+
+    #[test]
+    fn new_form_submits_existing_group_without_saving_group_default() {
+        let mut app = test_app(vec![]);
+        app.group_default_paths
+            .insert("work".to_string(), "/tmp/default".to_string());
+        app.mode = Mode::New(NewForm {
+            name: "deploy".to_string(),
+            path: "/tmp/work".to_string(),
+            group_name: "work".to_string(),
+            field_index: NEW_FIELDS.len() - 1,
+            ..NewForm::default()
+        });
+        let refreshed = vec![record("1", "work", "deploy", false)];
+        let mut actions = Vec::new();
+        let mut handle = |action| {
+            match action {
+                TuiAction::Create(request) => {
+                    actions.push(format!("create:{}:{}", request.group_name, request.path));
+                }
+                _ => actions.push("other".to_string()),
+            }
+            Ok(refreshed.clone())
+        };
+
+        handle_new_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            &mut handle,
+        )
+        .unwrap();
+
+        assert_eq!(actions, vec!["create:work:/tmp/work"]);
+        assert_eq!(
+            app.group_default_paths.get("work").map(String::as_str),
+            Some("/tmp/default")
+        );
+        assert_eq!(app.status_message.as_deref(), Some("created session"));
+    }
+
+    #[test]
     fn new_form_agent_field_is_selector() {
         let mut app = test_app(vec![]);
         app.mode = Mode::New(NewForm {
@@ -5213,6 +5608,8 @@ mod tests {
         session.command = "codex --model gpt-5".to_string();
         session.project_path = "/tmp/project".to_string();
         let mut app = test_app(vec![session]);
+        app.group_default_paths
+            .insert("work/api".to_string(), "/tmp/project".to_string());
         let mut handle = |_action| Ok(Vec::new());
 
         handle_normal_key(
@@ -5324,7 +5721,7 @@ mod tests {
 
         assert_eq!(
             footer_text(&app),
-            "Enter session s send S sync m move r restart f fork x stop d/u archive/restore Del remove Shift+Del cleanup | n new Ctrl-n shell N duplicate | g tools | j/k nav c/e groups Pg scroll / search a archived t status ? help q quit"
+            "Enter session m move r restart f fork | n new Ctrl-n shell N duplicate | g tools | j/k nav c/e groups Pg scroll / search a archived t status ? help q quit"
         );
     }
 
@@ -5502,6 +5899,8 @@ mod tests {
         let mut session = record("1", "work/api", "deploy", false);
         session.project_path = "/tmp/project".to_string();
         let mut app = test_app(vec![session]);
+        app.group_default_paths
+            .insert("work/api".to_string(), "/tmp/project".to_string());
         let mut handle = |_action| Ok(Vec::new());
 
         handle_normal_key(
@@ -5523,6 +5922,8 @@ mod tests {
         let mut session = record("1", "work/api", "deploy", false);
         session.project_path = "/tmp/project".to_string();
         let mut app = test_app(vec![session]);
+        app.group_default_paths
+            .insert("work/api".to_string(), "/tmp/project".to_string());
         let mut created = None;
         let mut handle = |action| {
             if let TuiAction::Create(request) = action {
@@ -5605,6 +6006,8 @@ mod tests {
     #[test]
     fn move_form_submits_group_change_and_preserves_selection() {
         let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
+        app.group_default_paths
+            .insert("core".to_string(), String::new());
         app.mode = Mode::Move(MoveForm {
             session_id: "1".to_string(),
             group_name: "core".to_string(),
@@ -5638,6 +6041,34 @@ mod tests {
         assert_eq!(selected.id, "1");
         assert_eq!(selected.group_name, "core");
         assert_eq!(app.status_message.as_deref(), Some("moved session"));
+    }
+
+    #[test]
+    fn move_form_rejects_unknown_group() {
+        let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
+        app.mode = Mode::Move(MoveForm {
+            session_id: "1".to_string(),
+            group_name: "missing".to_string(),
+        });
+        let mut actions = 0;
+        let mut handle = |_action| {
+            actions += 1;
+            Ok(Vec::new())
+        };
+
+        handle_move_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            &mut handle,
+        )
+        .unwrap();
+
+        assert_eq!(actions, 0);
+        assert!(matches!(app.mode, Mode::Move(_)));
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("group must already exist")
+        );
     }
 
     #[test]
@@ -5677,30 +6108,6 @@ mod tests {
         assert!(stop_requested);
         assert!(!app.deck_statuses.contains_key("1"));
         assert_eq!(app.details_session_id, None);
-    }
-
-    #[test]
-    fn sync_state_key_runs_action_and_refreshes_details() {
-        let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
-        let refreshed = app.sessions.clone();
-        let mut synced = None;
-        let mut handle = |action| {
-            if let TuiAction::SyncState(id) = action {
-                synced = Some(id);
-            }
-            Ok(refreshed.clone())
-        };
-
-        handle_normal_key(
-            KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT),
-            &mut app,
-            &mut handle,
-        )
-        .unwrap();
-
-        assert_eq!(synced.as_deref(), Some("1"));
-        assert_eq!(app.details_session_id, None);
-        assert_eq!(app.status_message.as_deref(), Some("synced state"));
     }
 
     #[test]
@@ -5801,72 +6208,51 @@ mod tests {
     }
 
     #[test]
-    fn normal_keys_run_selected_actions() {
+    fn normal_restart_key_runs_selected_action() {
         let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
         let refreshed = app.sessions.clone();
         let mut actions = Vec::new();
         let mut handle = |action| {
             match action {
-                TuiAction::Stop(id) => actions.push(format!("stop:{id}")),
                 TuiAction::Restart(id) => actions.push(format!("restart:{id}")),
-                TuiAction::Archive(id) => actions.push(format!("archive:{id}")),
-                TuiAction::Restore(id) => actions.push(format!("restore:{id}")),
-                TuiAction::Remove { session_id, mode } => {
-                    actions.push(format!("remove:{session_id}:{}", mode.as_str()))
-                }
                 _ => actions.push("other".to_string()),
             }
             Ok(refreshed.clone())
         };
 
         handle_normal_key(
-            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
-            &mut app,
-            &mut handle,
-        )
-        .unwrap();
-        handle_normal_key(
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
             &mut app,
             &mut handle,
         )
         .unwrap();
-        handle_normal_key(
-            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
-            &mut app,
-            &mut handle,
-        )
-        .unwrap();
-        handle_normal_key(
-            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
-            &mut app,
-            &mut handle,
-        )
-        .unwrap();
-        handle_normal_key(
-            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
-            &mut app,
-            &mut handle,
-        )
-        .unwrap();
-        handle_normal_key(
-            KeyEvent::new(KeyCode::Delete, KeyModifiers::SHIFT),
-            &mut app,
-            &mut handle,
-        )
-        .unwrap();
 
-        assert_eq!(
-            actions,
-            vec![
-                "stop:1",
-                "restart:1",
-                "archive:1",
-                "restore:1",
-                "remove:1:metadata_only",
-                "remove:1:cleanup_worktree"
-            ]
-        );
+        assert_eq!(actions, vec!["restart:1"]);
+    }
+
+    #[test]
+    fn removed_normal_hotkeys_do_nothing() {
+        let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
+        let refreshed = app.sessions.clone();
+        let mut actions = Vec::new();
+        let mut handle = |action| {
+            actions.push(format!("{action:?}"));
+            Ok(refreshed.clone())
+        };
+        for key in [
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::SHIFT),
+        ] {
+            handle_normal_key(key, &mut app, &mut handle).unwrap();
+        }
+        assert!(actions.is_empty());
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.status_message, None);
     }
 
     #[test]
@@ -5918,76 +6304,6 @@ mod tests {
     }
 
     #[test]
-    fn send_mode_submits_selected_input() {
-        let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
-        let refreshed = app.sessions.clone();
-        let mut sent = None;
-        let mut handle = |action| {
-            if let TuiAction::Send { session_id, text } = action {
-                sent = Some((session_id, text));
-            }
-            Ok(refreshed.clone())
-        };
-
-        handle_normal_key(
-            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
-            &mut app,
-            &mut handle,
-        )
-        .unwrap();
-        handle_send_key(
-            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
-            &mut app,
-            &mut handle,
-        )
-        .unwrap();
-        handle_send_key(
-            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
-            &mut app,
-            &mut handle,
-        )
-        .unwrap();
-        handle_send_key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &mut app,
-            &mut handle,
-        )
-        .unwrap();
-
-        assert_eq!(sent, Some(("1".to_string(), "hi".to_string())));
-        assert_eq!(app.status_message.as_deref(), Some("sent input"));
-    }
-
-    #[test]
-    fn send_mode_invalidates_details_cache() {
-        let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
-        app.mode = Mode::Send(SendForm {
-            text: "hello".to_string(),
-        });
-        let refreshed = app.sessions.clone();
-        let mut handle = |action| {
-            assert!(matches!(
-                action,
-                TuiAction::Send {
-                    ref session_id,
-                    ref text
-                } if session_id == "1" && text == "hello"
-            ));
-            Ok(refreshed.clone())
-        };
-
-        handle_send_key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &mut app,
-            &mut handle,
-        )
-        .unwrap();
-
-        assert!(!app.deck_statuses.contains_key("1"));
-        assert_eq!(app.details_session_id, None);
-    }
-
-    #[test]
     fn session_mode_ctrl_q_returns_to_dashboard() {
         let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
         app.mode = Mode::Session(SendForm::default());
@@ -6000,6 +6316,68 @@ mod tests {
 
         assert_eq!(app.mode, Mode::Normal);
         assert_eq!(app.status_message.as_deref(), Some("returned to dashboard"));
+    }
+
+    #[test]
+    fn session_mode_only_plain_ctrl_q_returns_to_dashboard() {
+        let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
+        app.mode = Mode::Session(SendForm::default());
+        handle_session_key(
+            KeyEvent::new(
+                KeyCode::Char('q'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            &mut app,
+        )
+        .unwrap();
+        assert!(matches!(app.mode, Mode::Session(_)));
+        assert_eq!(app.status_message, None);
+    }
+
+    #[test]
+    fn global_ctrl_c_does_not_quit_session_mode() {
+        assert!(!is_global_quit_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &Mode::Session(SendForm::default()),
+        ));
+        assert!(is_global_quit_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &Mode::Normal,
+        ));
+    }
+
+    #[test]
+    fn session_mode_releases_mouse_capture_for_terminal_selection() {
+        assert!(!should_capture_mouse(&Mode::Session(SendForm::default())));
+        assert!(should_capture_mouse(&Mode::Normal));
+    }
+
+    #[test]
+    fn render_new_form_marks_active_text_entry() {
+        let backend = ratatui::backend::TestBackend::new(100, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = test_app(vec![]);
+        app.mode = Mode::New(NewForm {
+            name: "deploy".to_string(),
+            ..NewForm::default()
+        });
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("NEW SESSION"));
+        assert!(text.contains("[ deploy ]"));
+        assert!(terminal.backend().cursor_visible());
+        let Mode::New(form) = &app.mode else {
+            panic!("expected new form");
+        };
+        let expected_cursor = new_form_cursor_position(
+            form,
+            body_layout(Rect::new(0, 4, 100, 13), app.sidebar_percent).detail,
+        )
+        .unwrap();
+        let cursor = terminal.backend().cursor_position();
+        assert_eq!((cursor.x, cursor.y), expected_cursor);
     }
 
     #[test]
@@ -6794,6 +7172,7 @@ mod tests {
         App {
             sessions,
             collapsed_groups: BTreeSet::new(),
+            group_default_paths: BTreeMap::new(),
             deck_statuses: BTreeMap::from([("1".to_string(), SessionDeckStatus::Waiting.into())]),
             details: TuiDetails {
                 deck_status: SessionDeckStatus::Waiting,
@@ -6848,6 +7227,21 @@ mod tests {
         match &app.mode {
             Mode::New(form) => Some(form.agent.as_str()),
             _ => None,
+        }
+    }
+
+    fn group_record(name: &str, default_project_path: &str, collapsed: bool) -> GroupRecord {
+        GroupRecord {
+            id: format!("{name}-group"),
+            profile: "default".to_string(),
+            name: name.to_string(),
+            default_project_path: default_project_path.to_string(),
+            collapsed,
+            display_order: 0,
+            metadata: "{}".to_string(),
+            version: 0,
+            created_at: 0,
+            updated_at: 0,
         }
     }
 
