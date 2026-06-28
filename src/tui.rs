@@ -12,7 +12,10 @@ use crossterm::{
         MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        Clear as TerminalClear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
+        disable_raw_mode, enable_raw_mode,
+    },
 };
 use names::{Generator, Name};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -179,7 +182,6 @@ pub struct DashboardView {
     pub selected: Option<SessionSummary>,
     pub selected_index: usize,
     pub visible_count: usize,
-    pub hidden_archived: usize,
 }
 
 impl DashboardView {
@@ -187,7 +189,6 @@ impl DashboardView {
         sessions: &[SessionRecord],
         query: &str,
         selected_index: usize,
-        show_archived: bool,
         status_filter: StatusFilter,
     ) -> Self {
         let collapsed_groups = BTreeSet::new();
@@ -197,7 +198,6 @@ impl DashboardView {
             &collapsed_groups,
             query,
             selected_index,
-            show_archived,
             status_filter,
         )
     }
@@ -207,7 +207,6 @@ impl DashboardView {
         collapsed_groups: &BTreeSet<String>,
         query: &str,
         selected_index: usize,
-        show_archived: bool,
         status_filter: StatusFilter,
     ) -> Self {
         Self::build_with_statuses(
@@ -216,7 +215,6 @@ impl DashboardView {
             collapsed_groups,
             query,
             selected_index,
-            show_archived,
             status_filter,
         )
     }
@@ -227,18 +225,11 @@ impl DashboardView {
         collapsed_groups: &BTreeSet<String>,
         query: &str,
         selected_index: usize,
-        show_archived: bool,
         status_filter: StatusFilter,
     ) -> Self {
         let query = query.trim().to_ascii_lowercase();
-        let hidden_archived = if show_archived {
-            0
-        } else {
-            sessions.iter().filter(|session| session.archived).count()
-        };
         let mut rows = sessions
             .iter()
-            .filter(|session| show_archived || !session.archived)
             .filter(|session| {
                 status_filter.matches(
                     deck_statuses
@@ -314,7 +305,6 @@ impl DashboardView {
             selected,
             selected_index,
             visible_count,
-            hidden_archived,
         }
     }
 }
@@ -357,7 +347,6 @@ pub struct SessionSummary {
     pub status: SessionStatus,
     pub deck_status: SessionDeckStatus,
     pub activity: Option<SessionActivity>,
-    pub archived: bool,
     updated_at: i64,
 }
 
@@ -383,7 +372,6 @@ impl SessionSummary {
                 .map(|status| status.deck_status)
                 .unwrap_or_else(|| lifecycle_deck_status(session.status)),
             activity: status.and_then(|status| status.activity.clone()),
-            archived: session.archived,
             updated_at: session.updated_at,
         }
     }
@@ -396,8 +384,6 @@ pub enum TuiAction {
     Stop(String),
     Restart(String),
     Fork(ForkSessionRequest),
-    Archive(String),
-    Restore(String),
     Search {
         query: String,
         limit: usize,
@@ -524,13 +510,22 @@ where
     D: FnMut(&str) -> Result<TuiDetails>,
     S: FnMut(&[String]) -> Result<Vec<(String, TuiSessionStatus)>>,
 {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-
+    let stdout = io::stdout();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    terminal.clear()?;
+    enable_raw_mode()?;
+    if let Err(err) = execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    ) {
+        let _ = disable_raw_mode();
+        return Err(err.into());
+    }
+    if let Err(err) = clear_terminal_screen(&mut terminal) {
+        let _ = restore_terminal(&mut terminal);
+        return Err(err);
+    }
     let mut app = app_from_initial(initial);
 
     let result = run_app(
@@ -540,15 +535,32 @@ where
         &mut load_details,
         &mut handle_action,
     );
-    terminal.clear()?;
-    disable_raw_mode()?;
-    execute!(
+    let cleanup_result = restore_terminal(&mut terminal);
+    result?;
+    cleanup_result
+}
+
+fn clear_terminal_screen(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    execute!(terminal.backend_mut(), TerminalClear(ClearType::All))?;
+    Ok(())
+}
+
+fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    let clear_result = clear_terminal_screen(terminal);
+    let raw_result = disable_raw_mode().map_err(AppError::from);
+    let screen_result = execute!(
         terminal.backend_mut(),
         DisableMouseCapture,
         LeaveAlternateScreen
-    )?;
-    terminal.show_cursor()?;
-    result
+    )
+    .map_err(AppError::from);
+    let cursor_result = terminal.show_cursor().map_err(AppError::from);
+
+    clear_result?;
+    raw_result?;
+    screen_result?;
+    cursor_result?;
+    Ok(())
 }
 
 struct App {
@@ -563,7 +575,6 @@ struct App {
     selected_index: usize,
     detail_scroll: u16,
     preview_scroll: u16,
-    show_archived: bool,
     status_filter: StatusFilter,
     sidebar_percent: u16,
     resizing_sidebar: bool,
@@ -604,7 +615,6 @@ fn app_from_initial(initial: TuiInitialState) -> App {
         selected_index: 0,
         detail_scroll: 0,
         preview_scroll: 0,
-        show_archived: false,
         status_filter: StatusFilter::All,
         sidebar_percent: DEFAULT_SIDEBAR_PERCENT,
         resizing_sidebar: false,
@@ -631,7 +641,6 @@ impl App {
             &self.collapsed_groups,
             self.local_filter_query(),
             self.selected_index,
-            self.show_archived,
             self.status_filter,
         )
     }
@@ -2141,7 +2150,6 @@ where
     refresh_details(app, load_details, true)?;
     let preview_worker = PreviewWorker::spawn();
     let mut tui_loop = TuiLoop::new(Instant::now());
-    let mut mouse_capture_enabled = true;
     loop {
         let now = Instant::now();
         if tui_loop.should_refresh_sessions(now) {
@@ -2156,13 +2164,6 @@ where
             tui_loop.mark_animated(Instant::now());
         }
 
-        if sync_mouse_capture(
-            terminal,
-            &mut mouse_capture_enabled,
-            should_capture_mouse(&app.mode),
-        )? {
-            tui_loop.mark_changed();
-        }
         if sync_embedded_tmux(terminal, app) {
             tui_loop.mark_changed();
         }
@@ -2433,27 +2434,6 @@ fn tmux_target_for_session(session: &SessionSummary) -> String {
         .unwrap_or_else(|| tmux_session_name_for_id(&session.id))
 }
 
-fn should_capture_mouse(mode: &Mode) -> bool {
-    !matches!(mode, Mode::Session(_))
-}
-
-fn sync_mouse_capture(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    mouse_capture_enabled: &mut bool,
-    should_enable: bool,
-) -> Result<bool> {
-    if *mouse_capture_enabled == should_enable {
-        return Ok(false);
-    }
-    if should_enable {
-        execute!(terminal.backend_mut(), EnableMouseCapture)?;
-    } else {
-        execute!(terminal.backend_mut(), DisableMouseCapture)?;
-    }
-    *mouse_capture_enabled = should_enable;
-    Ok(true)
-}
-
 fn process_key<F>(
     _terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
@@ -2590,7 +2570,6 @@ where
     let session_ids = app
         .sessions
         .iter()
-        .filter(|session| app.show_archived || !session.archived)
         .filter(|session| query.is_empty() || matches_query(session, &query))
         .map(|session| session.id.clone())
         .collect::<Vec<_>>();
@@ -2727,7 +2706,6 @@ where
         KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
         KeyCode::Char('?') | KeyCode::Char('h') => app.mode = Mode::Help,
         KeyCode::Char('/') => app.mode = Mode::Search,
-        KeyCode::Char('a') => app.show_archived = !app.show_archived,
         KeyCode::Char('c') => toggle_selected_group(app, handle_action)?,
         KeyCode::Char('e') => expand_groups(app, handle_action)?,
         KeyCode::Char('g') => open_tool_settings(app),
@@ -2766,6 +2744,24 @@ where
         KeyCode::Char('r') => {
             run_selected_action(app, handle_action, TuiAction::Restart, "restarted")?
         }
+        KeyCode::Char('d') => run_selected_action(
+            app,
+            handle_action,
+            |session_id| TuiAction::Remove {
+                session_id,
+                mode: DeleteMode::MetadataOnly,
+            },
+            "deleted",
+        )?,
+        KeyCode::Char('D') => run_selected_action(
+            app,
+            handle_action,
+            |session_id| TuiAction::Remove {
+                session_id,
+                mode: DeleteMode::CleanupWorktree,
+            },
+            "deleted and cleaned up",
+        )?,
         KeyCode::Char('f') => {
             if let Some(session) = app.view().selected {
                 app.mode = Mode::Fork(ForkForm::for_session(&session));
@@ -3588,7 +3584,6 @@ fn divider(active: bool) -> Paragraph<'static> {
 
 fn header(app: &App, view: &DashboardView) -> Paragraph<'static> {
     let counts = view_status_counts(view);
-    let archived = if app.show_archived { "all" } else { "active" };
     let search = if app.query.trim().is_empty() {
         "all".to_string()
     } else {
@@ -3602,9 +3597,7 @@ fn header(app: &App, view: &DashboardView) -> Paragraph<'static> {
             counts.queued, counts.waiting, counts.idle
         )),
         Span::raw(format!("  {} visible", view.visible_count)),
-        Span::raw(format!("  {} hidden", view.hidden_archived)),
         Span::raw(format!("  filter {search}")),
-        Span::raw(format!("  archive {archived}")),
     ];
     if !message.is_empty() {
         filters.push(Span::raw("  "));
@@ -3667,7 +3660,6 @@ fn session_list(view: &DashboardView, animation_frame: usize) -> (List<'static>,
             } else {
                 "|-"
             };
-            let archived = if session.archived { " archived" } else { "" };
             let mut row = vec![
                 Span::styled(branch, muted_style()),
                 Span::raw(" "),
@@ -3679,7 +3671,6 @@ fn session_list(view: &DashboardView, animation_frame: usize) -> (List<'static>,
                 Span::raw(session.name.clone()),
                 Span::raw(if session.pr_number.is_some() { " " } else { "" }),
                 Span::styled(session_pr_label(session.pr_number), pr_style()),
-                Span::raw(archived),
                 Span::raw(" "),
                 Span::styled(session.agent.clone(), agent_style(&session.agent)),
                 Span::raw(" "),
@@ -3836,10 +3827,11 @@ fn help_panel() -> Paragraph<'static> {
         Line::from(""),
         section_line("Actions"),
         Line::from("n new session | Ctrl-n shell | N duplicate | m move group"),
-        Line::from("r restart | f fork | g opens profile tool settings"),
+        Line::from("r restart | f fork | d delete | D delete and clean up"),
+        Line::from("g opens profile tool settings"),
         Line::from(""),
         section_line("Filters"),
-        Line::from("/ search | a toggle archived | t status filter | PageUp/PageDown scroll"),
+        Line::from("/ search | t status filter | PageUp/PageDown scroll"),
         Line::from(""),
         section_line("Help"),
         Line::from("? or h open help | Esc/q close"),
@@ -3877,7 +3869,6 @@ fn dashboard_lines(app: &App, view: &DashboardView) -> Vec<Line<'static>> {
     }
 
     let counts = view_status_counts(view);
-    let archived = if app.show_archived { "shown" } else { "hidden" };
     let mut lines = vec![
         Line::from(vec![
             Span::styled("Fleet", section_style()),
@@ -3896,10 +3887,6 @@ fn dashboard_lines(app: &App, view: &DashboardView) -> Vec<Line<'static>> {
             counts.idle,
             counts.stopped,
             counts.errored
-        )),
-        Line::from(format!(
-            "archived {archived}; {} hidden",
-            view.hidden_archived
         )),
         Line::from(""),
         section_line("Groups"),
@@ -3972,11 +3959,7 @@ fn session_summary_lines(
             Span::raw(short_id(&session.id)),
             Span::raw("   "),
             Span::styled("state ", muted_style()),
-            Span::raw(if session.archived {
-                "archived"
-            } else {
-                "active"
-            }),
+            Span::raw(session.status.as_str()),
         ]),
         Line::from(vec![
             Span::styled("fork ", muted_style()),
@@ -4576,7 +4559,7 @@ fn footer_text(app: &App) -> String {
         }
         Mode::Help => "Help: Esc/q close".to_string(),
         Mode::Normal => {
-            "Enter session m move r restart f fork | n new Ctrl-n shell N duplicate | g tools | j/k nav c/e groups Pg scroll / search a archived t status ? help q quit".to_string()
+            "Enter session m move r restart f fork d delete D cleanup | n new Ctrl-n shell N duplicate | g tools | j/k nav c/e groups Pg scroll / search t status ? help q quit".to_string()
         }
     }
 }
@@ -4787,7 +4770,7 @@ mod tests {
             record("2", "core", "build", false),
             record("3", "ops", "logs", false),
         ];
-        let view = DashboardView::build(&sessions, "", 0, false, StatusFilter::All);
+        let view = DashboardView::build(&sessions, "", 0, StatusFilter::All);
 
         assert_eq!(view.visible_count, 3);
         assert_eq!(
@@ -4813,7 +4796,6 @@ mod tests {
             &collapsed_groups,
             "",
             0,
-            false,
             StatusFilter::All,
         );
 
@@ -4843,7 +4825,6 @@ mod tests {
             ],
             "",
             1,
-            false,
             StatusFilter::All,
         );
 
@@ -4860,7 +4841,7 @@ mod tests {
         ];
         sessions[1].command = "Cargo Test".to_string();
 
-        let view = DashboardView::build(&sessions, "test", 0, false, StatusFilter::All);
+        let view = DashboardView::build(&sessions, "test", 0, StatusFilter::All);
 
         assert_eq!(view.visible_count, 1);
         assert_eq!(view.selected.unwrap().id, "2");
@@ -4961,19 +4942,15 @@ mod tests {
     }
 
     #[test]
-    fn archived_is_hidden_by_default() {
+    fn archived_sessions_remain_visible() {
         let sessions = vec![
             record("1", "ops", "deploy", false),
             record("2", "ops", "old", true),
         ];
 
-        let hidden = DashboardView::build(&sessions, "", 0, false, StatusFilter::All);
-        let shown = DashboardView::build(&sessions, "", 0, true, StatusFilter::All);
+        let view = DashboardView::build(&sessions, "", 0, StatusFilter::All);
 
-        assert_eq!(hidden.visible_count, 1);
-        assert_eq!(hidden.hidden_archived, 1);
-        assert_eq!(shown.visible_count, 2);
-        assert_eq!(shown.hidden_archived, 0);
+        assert_eq!(view.visible_count, 2);
     }
 
     #[test]
@@ -4982,7 +4959,7 @@ mod tests {
         let mut stopped = record("2", "ops", "old", false);
         stopped.status = SessionStatus::Stopped;
 
-        let view = DashboardView::build(&[running, stopped], "", 0, false, StatusFilter::Stopped);
+        let view = DashboardView::build(&[running, stopped], "", 0, StatusFilter::Stopped);
 
         assert_eq!(view.visible_count, 1);
         assert_eq!(view.selected.unwrap().id, "2");
@@ -5000,7 +4977,6 @@ mod tests {
             &collapsed_groups,
             "",
             0,
-            false,
             StatusFilter::Waiting,
         );
 
@@ -5046,7 +5022,6 @@ mod tests {
             &collapsed_groups,
             "",
             0,
-            false,
             StatusFilter::All,
         );
 
@@ -5068,7 +5043,6 @@ mod tests {
             &collapsed_groups,
             "",
             1,
-            false,
             StatusFilter::All,
         );
 
@@ -5095,7 +5069,6 @@ mod tests {
             &collapsed_groups,
             "",
             1,
-            false,
             StatusFilter::All,
         );
 
@@ -5123,7 +5096,6 @@ mod tests {
             selected_index: 0,
             detail_scroll: 0,
             preview_scroll: 0,
-            show_archived: false,
             status_filter: StatusFilter::All,
             sidebar_percent: DEFAULT_SIDEBAR_PERCENT,
             resizing_sidebar: false,
@@ -5735,7 +5707,7 @@ mod tests {
 
         assert_eq!(
             footer_text(&app),
-            "Enter session m move r restart f fork | n new Ctrl-n shell N duplicate | g tools | j/k nav c/e groups Pg scroll / search a archived t status ? help q quit"
+            "Enter session m move r restart f fork d delete D cleanup | n new Ctrl-n shell N duplicate | g tools | j/k nav c/e groups Pg scroll / search t status ? help q quit"
         );
     }
 
@@ -6245,6 +6217,43 @@ mod tests {
     }
 
     #[test]
+    fn normal_delete_keys_run_selected_remove_actions() {
+        let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
+        let refreshed = app.sessions.clone();
+        let mut actions = Vec::new();
+        let mut handle = |action| {
+            match action {
+                TuiAction::Remove { session_id, mode } => {
+                    actions.push((session_id, mode));
+                }
+                _ => actions.push(("other".to_string(), DeleteMode::Purge)),
+            }
+            Ok(refreshed.clone())
+        };
+
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            &mut app,
+            &mut handle,
+        )
+        .unwrap();
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT),
+            &mut app,
+            &mut handle,
+        )
+        .unwrap();
+
+        assert_eq!(
+            actions,
+            vec![
+                ("1".to_string(), DeleteMode::MetadataOnly),
+                ("1".to_string(), DeleteMode::CleanupWorktree),
+            ]
+        );
+    }
+
+    #[test]
     fn removed_normal_hotkeys_do_nothing() {
         let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
         let refreshed = app.sessions.clone();
@@ -6257,7 +6266,6 @@ mod tests {
             KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
             KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE),
             KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
-            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
             KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
             KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
             KeyEvent::new(KeyCode::Delete, KeyModifiers::SHIFT),
@@ -6358,12 +6366,6 @@ mod tests {
             KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
             &Mode::Normal,
         ));
-    }
-
-    #[test]
-    fn session_mode_releases_mouse_capture_for_terminal_selection() {
-        assert!(!should_capture_mouse(&Mode::Session(SendForm::default())));
-        assert!(should_capture_mouse(&Mode::Normal));
     }
 
     #[test]
@@ -7200,7 +7202,6 @@ mod tests {
             selected_index: 0,
             detail_scroll: 0,
             preview_scroll: 0,
-            show_archived: false,
             status_filter: StatusFilter::All,
             sidebar_percent: DEFAULT_SIDEBAR_PERCENT,
             resizing_sidebar: false,

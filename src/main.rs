@@ -7,8 +7,8 @@ use agent_helm::{
     controller::ApplicationController,
     error::Result,
     models::{
-        ArchiveSessionRequest, CostFilter, CreateSession, DeleteMode, DeleteSessionRequest,
-        ForkSessionRequest, ProjectSpec, SessionDeckStatus, StructuredEvent, now_ts,
+        CostFilter, CreateSession, DeleteMode, DeleteSessionRequest, ForkSessionRequest,
+        ProjectSpec, SessionDeckStatus, StructuredEvent, now_ts,
     },
     runtime::TmuxRuntime,
 };
@@ -70,10 +70,6 @@ enum Command {
     #[command(alias = "ls")]
     List {
         #[arg(long)]
-        all: bool,
-        #[arg(long)]
-        archived: bool,
-        #[arg(long)]
         group: Option<String>,
         #[arg(long)]
         status: Option<String>,
@@ -113,16 +109,6 @@ enum Command {
         purge: bool,
         #[arg(long)]
         cleanup_worktree: bool,
-    },
-    Archive {
-        session: String,
-        #[arg(long, default_value = "cli")]
-        by: String,
-        #[arg(long, default_value = "")]
-        reason: String,
-    },
-    Restore {
-        session: String,
     },
     Fork {
         session: String,
@@ -213,10 +199,6 @@ enum SessionCommand {
     #[command(alias = "ls")]
     List {
         #[arg(long)]
-        all: bool,
-        #[arg(long)]
-        archived: bool,
-        #[arg(long)]
         group: Option<String>,
         #[arg(long)]
         status: Option<String>,
@@ -248,16 +230,6 @@ enum SessionCommand {
         purge: bool,
         #[arg(long)]
         cleanup_worktree: bool,
-    },
-    Archive {
-        session: String,
-        #[arg(long, default_value = "cli")]
-        by: String,
-        #[arg(long, default_value = "")]
-        reason: String,
-    },
-    Restore {
-        session: String,
     },
     Fork {
         session: String,
@@ -445,8 +417,6 @@ struct CostFilterArgs {
     start_at: Option<i64>,
     #[arg(long)]
     end_at: Option<i64>,
-    #[arg(long)]
-    active_only: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -685,12 +655,7 @@ fn run_command(
                 },
             )?;
         }
-        Command::List {
-            all,
-            archived,
-            group,
-            status,
-        } => print_session_list(&controller, json, all, archived, group, status)?,
+        Command::List { group, status } => print_session_list(&controller, json, group, status)?,
         Command::Show { session } => print_record(&controller.get_session(&session)?, json)?,
         Command::Status { session } => {
             print_json_or_debug(&controller.status_snapshot(&session)?, json)?
@@ -724,20 +689,6 @@ fn run_command(
             })?;
             print_json_or_debug(&result, json)?;
         }
-        Command::Archive {
-            session,
-            by,
-            reason,
-        } => {
-            let result = controller.archive_session(ArchiveSessionRequest {
-                session_id: session,
-                archived_by: by,
-                reason,
-                stop_if_running: true,
-            })?;
-            print_json_or_debug(&result, json)?;
-        }
-        Command::Restore { session } => print_record(&controller.restore_session(&session)?, json)?,
         Command::Fork {
             session,
             name,
@@ -1026,7 +977,6 @@ fn run_command(
                         model: filter.model,
                         start_at: filter.start_at.unwrap_or(0),
                         end_at: filter.end_at.unwrap_or(now),
-                        include_archived: !filter.active_only,
                     },
                     offset,
                     limit,
@@ -1044,13 +994,12 @@ fn run_command(
                     model: filter.model,
                     start_at: filter.start_at.unwrap_or(0),
                     end_at: filter.end_at.unwrap_or(now),
-                    include_archived: !filter.active_only,
                 })?;
                 print_json_or_debug(&summary, json)?;
             }
         },
         Command::Tui => {
-            let sessions = controller.list_sessions(true)?;
+            let sessions = controller.list_sessions()?;
             let groups = controller.list_groups()?;
             let status_controller = controller.clone();
             let details_controller = controller.clone();
@@ -1149,17 +1098,6 @@ fn run_command(
                         TuiAction::Fork(request) => {
                             action_controller.fork_session(request)?;
                         }
-                        TuiAction::Archive(session) => {
-                            action_controller.archive_session(ArchiveSessionRequest {
-                                session_id: session,
-                                archived_by: "tui".to_string(),
-                                reason: "tui archive".to_string(),
-                                stop_if_running: true,
-                            })?;
-                        }
-                        TuiAction::Restore(session) => {
-                            action_controller.restore_session(&session)?;
-                        }
                         TuiAction::Search { query, limit } => {
                             let response = action_controller.search_sessions(&query, limit)?;
                             let mut sessions = Vec::new();
@@ -1221,7 +1159,7 @@ fn run_command(
                             action_controller.config.save_tool_settings(tools)?;
                         }
                     }
-                    action_controller.list_sessions(true)
+                    action_controller.list_sessions()
                 },
             )?;
         }
@@ -1243,17 +1181,12 @@ fn create_session(
 fn print_session_list(
     controller: &ApplicationController<TmuxRuntime>,
     json: bool,
-    all: bool,
-    archived: bool,
     group: Option<String>,
     status: Option<String>,
 ) -> Result<()> {
     let status = status.as_deref().map(normalize_status_filter);
     let mut sessions = Vec::new();
-    for session in controller.list_sessions(all || archived)? {
-        if archived && !session.archived {
-            continue;
-        }
+    for session in controller.list_sessions()? {
         if group
             .as_deref()
             .is_some_and(|group| session.group_name != group)
@@ -1294,12 +1227,9 @@ fn run_session_command(
             print_record(&controller.restart(&session)?, json)?
         }
         SessionCommand::Stop { session } => print_record(&controller.stop(&session)?, json)?,
-        SessionCommand::List {
-            all,
-            archived,
-            group,
-            status,
-        } => print_session_list(controller, json, all, archived, group, status)?,
+        SessionCommand::List { group, status } => {
+            print_session_list(controller, json, group, status)?
+        }
         SessionCommand::Create {
             path,
             agent,
@@ -1344,22 +1274,6 @@ fn run_session_command(
                 reason: "cli session remove".to_string(),
             })?;
             print_json_or_debug(&result, json)?;
-        }
-        SessionCommand::Archive {
-            session,
-            by,
-            reason,
-        } => {
-            let result = controller.archive_session(ArchiveSessionRequest {
-                session_id: session,
-                archived_by: by,
-                reason,
-                stop_if_running: true,
-            })?;
-            print_json_or_debug(&result, json)?;
-        }
-        SessionCommand::Restore { session } => {
-            print_record(&controller.restore_session(&session)?, json)?
         }
         SessionCommand::Fork {
             session,
@@ -1567,16 +1481,8 @@ mod tests {
 
         match cli.command {
             Some(Command::Session {
-                command:
-                    SessionCommand::List {
-                        all,
-                        archived,
-                        group,
-                        status,
-                    },
+                command: SessionCommand::List { group, status },
             }) => {
-                assert!(!all);
-                assert!(!archived);
                 assert_eq!(group.as_deref(), Some("work/api"));
                 assert_eq!(status.as_deref(), Some("waiting"));
             }

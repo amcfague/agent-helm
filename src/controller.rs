@@ -6,14 +6,14 @@ use crate::{
         SessionMaterializationPlan, session_materialization_json, session_materialization_plan,
     },
     models::{
-        AgentStateSyncResult, ArchiveSessionRequest, ArchiveSessionResult, AttachmentStatus,
-        CleanupReport, ConductorAssignmentRecord, ConductorRecord, ConductorStatus, CostEvent,
-        CostFilter, CostSummary, CreateSession, DeleteMode, DeleteSessionRequest, DeletionResult,
-        ForkSessionRequest, ForkSessionResult, GroupRecord, LaunchSpec, McpAttachmentRecord,
-        OutputPage, ProjectRecord, ProjectSpec, ProjectTrustState, SandboxLaunchSpec,
-        SessionRecord, SessionSearchResponse, SessionSearchResult, SessionStatus,
-        SessionStatusSnapshot, SkillAttachmentRecord, StructuredEvent, WatcherEventRecord,
-        WatcherRecord, WatcherStatus, WorkspaceRecord, WorktreeRecord, WorktreeStatus, now_ts,
+        AgentStateSyncResult, AttachmentStatus, CleanupReport, ConductorAssignmentRecord,
+        ConductorRecord, ConductorStatus, CostEvent, CostFilter, CostSummary, CreateSession,
+        DeleteMode, DeleteSessionRequest, DeletionResult, ForkSessionRequest, ForkSessionResult,
+        GroupRecord, LaunchSpec, McpAttachmentRecord, OutputPage, ProjectRecord, ProjectSpec,
+        ProjectTrustState, SandboxLaunchSpec, SessionRecord, SessionSearchResponse,
+        SessionSearchResult, SessionStatus, SessionStatusSnapshot, SkillAttachmentRecord,
+        StructuredEvent, WatcherEventRecord, WatcherRecord, WatcherStatus, WorkspaceRecord,
+        WorktreeRecord, WorktreeStatus, now_ts,
     },
     runtime::SessionRuntime,
     security::{
@@ -289,18 +289,12 @@ impl<R: SessionRuntime> ApplicationController<R> {
         Ok(session)
     }
 
-    pub fn list_sessions(&self, include_archived: bool) -> Result<Vec<SessionRecord>> {
+    pub fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
         self.store.init()?;
         self.store
-            .list_sessions(include_archived)?
+            .list_sessions()?
             .into_iter()
-            .map(|session| {
-                if session.archived {
-                    Ok(session)
-                } else {
-                    self.status(&session.id)
-                }
-            })
+            .map(|session| self.status(&session.id))
             .collect()
     }
 
@@ -546,9 +540,6 @@ impl<R: SessionRuntime> ApplicationController<R> {
     pub fn restart(&self, id: &str) -> Result<SessionRecord> {
         self.ensure_writable()?;
         let session = self.get_session(id)?;
-        if session.archived {
-            return Err(AppError::msg("session is archived; restore first"));
-        }
         let spec = self.launch_spec(&session)?;
         let handle = self.runtime.restart(id, &spec)?;
         let session = self.store.update_runtime(
@@ -566,42 +557,6 @@ impl<R: SessionRuntime> ApplicationController<R> {
         self.ensure_writable()?;
         self.runtime.destroy(id)?;
         self.store.remove_session(id)
-    }
-
-    pub fn archive_session(&self, request: ArchiveSessionRequest) -> Result<ArchiveSessionResult> {
-        self.ensure_writable()?;
-        let session = self.get_session(&request.session_id)?;
-        let runtime_stopped = request.stop_if_running && self.runtime_is_running(&session)?;
-        if runtime_stopped {
-            self.runtime.destroy(&request.session_id)?;
-        }
-        let mut session = self.store.archive_session(&request.session_id)?;
-        if runtime_stopped {
-            session = self.store.update_runtime(
-                &request.session_id,
-                session.version,
-                None,
-                SessionStatus::Stopped,
-            )?;
-        }
-        self.store.append_session_event(
-            &request.session_id,
-            "archived",
-            json!({ "by": request.archived_by, "reason": request.reason }),
-        )?;
-        Ok(ArchiveSessionResult {
-            session_id: session.id,
-            archived: session.archived,
-            runtime_stopped,
-        })
-    }
-
-    pub fn restore_session(&self, id: &str) -> Result<SessionRecord> {
-        self.ensure_writable()?;
-        let session = self.store.restore_session(id)?;
-        self.store
-            .append_session_event(id, "restored", json!({ "source": "restore_session" }))?;
-        Ok(session)
     }
 
     pub fn delete_session(&self, request: DeleteSessionRequest) -> Result<DeletionResult> {
@@ -622,7 +577,7 @@ impl<R: SessionRuntime> ApplicationController<R> {
             && let Some(worktree_id) = session.worktree_id.as_deref()
         {
             let deleting_id = request.session_id.as_str();
-            let has_other_owner = self.store.list_sessions(true)?.into_iter().any(|other| {
+            let has_other_owner = self.store.list_sessions()?.into_iter().any(|other| {
                 other.id != deleting_id && other.worktree_id.as_deref() == Some(worktree_id)
             });
             if !has_other_owner {
@@ -631,17 +586,14 @@ impl<R: SessionRuntime> ApplicationController<R> {
                 worktree_cleaned = worktree.cleanup_allowed;
             }
         }
-        match request.mode {
-            DeleteMode::Purge => self.store.purge_session(&request.session_id)?,
-            _ => self.store.remove_session(&request.session_id)?,
-        }
+        self.store.remove_session(&request.session_id)?;
         Ok(DeletionResult {
             session_id: request.session_id,
             deleted: true,
             runtime_stopped,
             worktree_cleaned,
             purged: matches!(request.mode, DeleteMode::Purge),
-            history_retained: !matches!(request.mode, DeleteMode::Purge),
+            history_retained: false,
         })
     }
 
@@ -776,7 +728,7 @@ impl<R: SessionRuntime> ApplicationController<R> {
         let project = self.get_project(id)?;
         let session_count = self
             .store
-            .list_sessions(true)?
+            .list_sessions()?
             .into_iter()
             .filter(|session| session.project_id == project.id)
             .count();
@@ -909,7 +861,7 @@ impl<R: SessionRuntime> ApplicationController<R> {
     ) -> Result<WorktreeRecord> {
         self.ensure_writable()?;
         let mut worktree = self.store.get_worktree(id)?;
-        let has_owner = self.store.list_sessions(true)?.into_iter().any(|session| {
+        let has_owner = self.store.list_sessions()?.into_iter().any(|session| {
             session.worktree_id.as_deref() == Some(id)
                 && Some(session.id.as_str()) != allowed_session_id
         });
@@ -949,7 +901,7 @@ impl<R: SessionRuntime> ApplicationController<R> {
             } else if worktree.status == WorktreeStatus::Finished && worktree.cleanup_allowed {
                 if self
                     .store
-                    .list_sessions(true)?
+                    .list_sessions()?
                     .into_iter()
                     .any(|session| session.worktree_id.as_deref() == Some(worktree.id.as_str()))
                 {
@@ -1871,7 +1823,7 @@ impl<R: SessionRuntime> ApplicationController<R> {
         let mut results = Vec::new();
         let limit = limit.max(1);
 
-        'sessions: for session in self.list_sessions(true)? {
+        'sessions: for session in self.list_sessions()? {
             if results.len() >= limit {
                 break;
             }
@@ -3004,8 +2956,8 @@ impl<R: SessionRuntime> AgentHelmApi for ApplicationController<R> {
         Ok(tools)
     }
 
-    fn list_sessions(&self, include_archived: bool) -> ApiResult<Vec<SessionRecord>> {
-        ApplicationController::list_sessions(self, include_archived).map_err(Into::into)
+    fn list_sessions(&self) -> ApiResult<Vec<SessionRecord>> {
+        ApplicationController::list_sessions(self).map_err(Into::into)
     }
 
     fn create_session(&self, request: CreateSession) -> ApiResult<SessionRecord> {
@@ -3050,14 +3002,6 @@ impl<R: SessionRuntime> AgentHelmApi for ApplicationController<R> {
 
     fn delete_session(&self, request: DeleteSessionRequest) -> ApiResult<DeletionResult> {
         ApplicationController::delete_session(self, request).map_err(Into::into)
-    }
-
-    fn archive_session(&self, request: ArchiveSessionRequest) -> ApiResult<ArchiveSessionResult> {
-        ApplicationController::archive_session(self, request).map_err(Into::into)
-    }
-
-    fn restore_session(&self, id: &str) -> ApiResult<SessionRecord> {
-        ApplicationController::restore_session(self, id).map_err(Into::into)
     }
 
     fn fork_session(&self, request: ForkSessionRequest) -> ApiResult<ForkSessionResult> {
@@ -3954,7 +3898,7 @@ mod tests {
         assert!(!session.project_id.is_empty());
         assert!(!session.workspace_id.is_empty());
         assert!(session.parent_session_id.is_none());
-        assert_eq!(controller.list_sessions(false).unwrap().len(), 1);
+        assert_eq!(controller.list_sessions().unwrap().len(), 1);
 
         controller.attach(&session.id).unwrap();
         controller.send(&session.id, "ping").unwrap();
@@ -3995,50 +3939,13 @@ mod tests {
             vec!["runtime_start", "runtime_stop", "runtime_restart"]
         );
         controller.remove(&session.id).unwrap();
-        assert!(controller.list_sessions(false).unwrap().is_empty());
-        let archived = controller.list_sessions(true).unwrap();
-        assert_eq!(archived.len(), 1);
-        assert!(archived[0].archived);
-    }
-
-    #[test]
-    fn archive_failure_keeps_live_runtime_metadata_when_destroy_fails() {
-        let controller = controller_with_runtime(FakeRuntime::failing_destroy(), false);
-        let session = controller
-            .create_session(CreateSession {
-                path: ".".into(),
-                agent: "shell".into(),
-                command: "cat".into(),
-                name: "archive-fails".into(),
-                group_name: "default".into(),
-                worktree: None,
-                carry_state: false,
-                sandbox: false,
-                prompt: None,
-                parent_session_id: None,
-            })
-            .unwrap();
-
-        let err = controller
-            .archive_session(ArchiveSessionRequest {
-                session_id: session.id.clone(),
-                archived_by: "test".into(),
-                reason: "destroy failure".into(),
-                stop_if_running: true,
-            })
-            .unwrap_err();
-        let stored = controller.get_session(&session.id).unwrap();
-
-        assert!(err.to_string().contains("fake runtime destroy failed"));
-        assert!(!stored.archived);
-        assert_eq!(stored.status, SessionStatus::Running);
-        assert!(stored.runtime_id.is_some());
+        assert!(controller.list_sessions().unwrap().is_empty());
         assert!(
-            !controller
-                .events(&session.id, 0, 20)
-                .unwrap()
-                .iter()
-                .any(|event| event.kind == "archived")
+            controller
+                .get_session(&session.id)
+                .unwrap_err()
+                .to_string()
+                .contains("session not found")
         );
     }
 
@@ -4070,40 +3977,8 @@ mod tests {
         let stored = controller.get_session(&session.id).unwrap();
 
         assert!(err.to_string().contains("fake runtime destroy failed"));
-        assert!(!stored.archived);
         assert_eq!(stored.status, SessionStatus::Running);
         assert!(stored.runtime_id.is_some());
-    }
-
-    #[test]
-    fn archive_stopped_session_reports_runtime_not_stopped() {
-        let controller = controller(false);
-        let session = controller
-            .create_session(CreateSession {
-                path: ".".into(),
-                agent: "shell".into(),
-                command: "cat".into(),
-                name: "archive-stopped".into(),
-                group_name: "default".into(),
-                worktree: None,
-                carry_state: false,
-                sandbox: false,
-                prompt: None,
-                parent_session_id: None,
-            })
-            .unwrap();
-        controller.stop(&session.id).unwrap();
-
-        let result = controller
-            .archive_session(ArchiveSessionRequest {
-                session_id: session.id.clone(),
-                archived_by: "test".into(),
-                reason: "stopped".into(),
-                stop_if_running: true,
-            })
-            .unwrap();
-
-        assert!(!result.runtime_stopped);
     }
 
     #[test]
@@ -4144,56 +4019,6 @@ mod tests {
                 },
             )
             .unwrap();
-    }
-
-    #[test]
-    fn archive_stops_live_runtime_with_missing_runtime_id() {
-        let controller = controller(false);
-        let session = controller
-            .create_session(CreateSession {
-                path: ".".into(),
-                agent: "shell".into(),
-                command: "cat".into(),
-                name: "runtime-metadata-missing".into(),
-                group_name: "default".into(),
-                worktree: None,
-                carry_state: false,
-                sandbox: false,
-                prompt: None,
-                parent_session_id: None,
-            })
-            .unwrap();
-        controller.stop(&session.id).unwrap();
-        restart_runtime_without_metadata(&controller, &session.id);
-        assert_eq!(
-            controller.status(&session.id).unwrap().status,
-            SessionStatus::Running
-        );
-        assert!(
-            controller
-                .get_session(&session.id)
-                .unwrap()
-                .runtime_id
-                .is_none()
-        );
-
-        let result = controller
-            .archive_session(ArchiveSessionRequest {
-                session_id: session.id.clone(),
-                archived_by: "test".into(),
-                reason: "missing runtime metadata".into(),
-                stop_if_running: true,
-            })
-            .unwrap();
-
-        assert!(result.runtime_stopped);
-        let archived = controller.get_session(&session.id).unwrap();
-        assert_eq!(archived.status, SessionStatus::Stopped);
-        assert!(archived.runtime_id.is_none());
-        assert_eq!(
-            controller.runtime.status(&session.id).unwrap(),
-            SessionStatus::Stopped
-        );
     }
 
     #[test]
@@ -4335,7 +4160,7 @@ mod tests {
             .unwrap();
         controller.runtime.destroy(&session.id).unwrap();
 
-        let sessions = controller.list_sessions(false).unwrap();
+        let sessions = controller.list_sessions().unwrap();
 
         assert_eq!(sessions[0].status, SessionStatus::Stopped);
         assert!(sessions[0].runtime_id.is_none());
@@ -4507,14 +4332,14 @@ mod tests {
     }
 
     #[test]
-    fn archived_session_can_be_restored() {
+    fn restart_removed_session_reports_not_found() {
         let controller = controller(false);
         let session = controller
             .create_session(CreateSession {
                 path: ".".into(),
                 agent: "shell".into(),
                 command: "cat".into(),
-                name: "archivable".into(),
+                name: "removable".into(),
                 group_name: "default".into(),
                 worktree: None,
                 carry_state: false,
@@ -4524,63 +4349,10 @@ mod tests {
             })
             .unwrap();
 
-        controller
-            .archive_session(ArchiveSessionRequest {
-                session_id: session.id.clone(),
-                archived_by: "test".to_string(),
-                reason: "round trip".to_string(),
-                stop_if_running: true,
-            })
-            .unwrap();
-        let archived = controller.get_session(&session.id).unwrap();
-        assert_eq!(archived.status, SessionStatus::Stopped);
-        assert!(archived.runtime_id.is_none());
-        assert!(controller.list_sessions(false).unwrap().is_empty());
-
-        let restored = controller.restore_session(&session.id).unwrap();
-        assert!(!restored.archived);
-        assert_eq!(controller.list_sessions(false).unwrap().len(), 1);
-        assert!(
-            controller
-                .events(&session.id, 0, 20)
-                .unwrap()
-                .iter()
-                .any(|event| event.kind == "restored")
-        );
-    }
-
-    #[test]
-    fn restart_archived_session_requires_restore() {
-        let controller = controller(false);
-        let session = controller
-            .create_session(CreateSession {
-                path: ".".into(),
-                agent: "shell".into(),
-                command: "cat".into(),
-                name: "archivable".into(),
-                group_name: "default".into(),
-                worktree: None,
-                carry_state: false,
-                sandbox: false,
-                prompt: None,
-                parent_session_id: None,
-            })
-            .unwrap();
-
-        controller
-            .archive_session(ArchiveSessionRequest {
-                session_id: session.id.clone(),
-                archived_by: "test".to_string(),
-                reason: "restart guard".to_string(),
-                stop_if_running: true,
-            })
-            .unwrap();
+        controller.remove(&session.id).unwrap();
 
         let err = controller.restart(&session.id).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("session is archived; restore first")
-        );
+        assert!(err.to_string().contains("session not found"));
     }
 
     #[test]
@@ -5007,7 +4779,7 @@ mod tests {
             controller.store.get_worktree(&worktree_id).unwrap().status,
             WorktreeStatus::Finished
         );
-        assert!(controller.list_sessions(false).unwrap().is_empty());
+        assert!(controller.list_sessions().unwrap().is_empty());
     }
 
     #[test]
@@ -5107,7 +4879,7 @@ mod tests {
 
         assert!(err.contains("sandbox path is outside allowed paths"));
         assert!(!expected_path.exists());
-        assert!(controller.list_sessions(true).unwrap().is_empty());
+        assert!(controller.list_sessions().unwrap().is_empty());
         let project = controller.list_projects().unwrap().pop().unwrap();
         assert!(controller.list_worktrees(&project.id).unwrap().is_empty());
     }
@@ -5204,7 +4976,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_cleanup_worktree_keeps_archived_shared_fork_worktree() {
+    fn delete_cleanup_worktree_cleans_removed_parent_fork_worktree() {
         let repo = tempfile::tempdir().unwrap();
         init_git_repo(repo.path());
         let data = tempfile::tempdir().unwrap();
@@ -5214,7 +4986,7 @@ mod tests {
                 path: repo.path().to_string_lossy().to_string(),
                 agent: "shell".into(),
                 command: "cat".into(),
-                name: "archived-parent-worktree".into(),
+                name: "removed-parent-worktree".into(),
                 group_name: "default".into(),
                 worktree: Some("agent-helm-child".into()),
                 carry_state: false,
@@ -5235,14 +5007,7 @@ mod tests {
                 start_immediately: true,
             })
             .unwrap();
-        controller
-            .archive_session(ArchiveSessionRequest {
-                session_id: parent.id,
-                archived_by: "test".into(),
-                reason: "shared worktree".into(),
-                stop_if_running: true,
-            })
-            .unwrap();
+        controller.remove(&parent.id).unwrap();
         let child = controller.get_session(&fork.child_session_id).unwrap();
 
         let result = controller
@@ -5253,11 +5018,11 @@ mod tests {
             })
             .unwrap();
 
-        assert!(!result.worktree_cleaned);
-        assert!(Path::new(&worktree.path).exists());
+        assert!(result.worktree_cleaned);
+        assert!(!Path::new(&worktree.path).exists());
         assert_eq!(
             controller.store.get_worktree(&worktree_id).unwrap().status,
-            WorktreeStatus::Ready
+            WorktreeStatus::Finished
         );
     }
 
@@ -6627,7 +6392,7 @@ mod tests {
             .to_string();
         assert!(err.contains("fake runtime start failed"));
 
-        let sessions = controller.list_sessions(true).unwrap();
+        let sessions = controller.list_sessions().unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].status, SessionStatus::Errored);
         assert_eq!(
@@ -6892,7 +6657,6 @@ mod tests {
                 model: None,
                 start_at: 0,
                 end_at: now_ts(),
-                include_archived: true,
             })
             .unwrap();
         assert_eq!(summary.total_tokens, 3);
@@ -7403,7 +7167,7 @@ mod tests {
             .to_string();
 
         assert!(err.contains("agent requires command: custom"));
-        let sessions = controller.list_sessions(true).unwrap();
+        let sessions = controller.list_sessions().unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].status, SessionStatus::Errored);
         assert_eq!(

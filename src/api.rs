@@ -2,13 +2,12 @@ use crate::{
     error::{AppError, Result},
     materialization::SessionMaterializationPlan,
     models::{
-        AgentStateSyncResult, ArchiveSessionRequest, ArchiveSessionResult, CleanupReport,
-        ConductorAssignmentRecord, ConductorRecord, CostEvent, CostFilter, CostSummary,
-        CreateSession, DeleteMode, DeleteSessionRequest, DeletionResult, ForkSessionRequest,
-        ForkSessionResult, GroupRecord, McpAttachmentRecord, OutputPage, ProjectRecord,
-        ProjectSpec, SessionEvent, SessionRecord, SessionSearchResponse, SessionStatusSnapshot,
-        SkillAttachmentRecord, StructuredEvent, WatcherEventRecord, WatcherRecord, WorkspaceRecord,
-        WorktreeRecord, now_ts,
+        AgentStateSyncResult, CleanupReport, ConductorAssignmentRecord, ConductorRecord, CostEvent,
+        CostFilter, CostSummary, CreateSession, DeleteMode, DeleteSessionRequest, DeletionResult,
+        ForkSessionRequest, ForkSessionResult, GroupRecord, McpAttachmentRecord, OutputPage,
+        ProjectRecord, ProjectSpec, SessionEvent, SessionRecord, SessionSearchResponse,
+        SessionStatusSnapshot, SkillAttachmentRecord, StructuredEvent, WatcherEventRecord,
+        WatcherRecord, WorkspaceRecord, WorktreeRecord, now_ts,
     },
 };
 use axum::{
@@ -32,7 +31,7 @@ pub type ApiResult<T> = std::result::Result<T, ApiError>;
 pub trait AgentHelmApi: Clone + Send + Sync + 'static {
     fn default_agent(&self) -> ApiResult<String>;
     fn tool_profiles(&self) -> ApiResult<Vec<ApiToolProfile>>;
-    fn list_sessions(&self, include_archived: bool) -> ApiResult<Vec<SessionRecord>>;
+    fn list_sessions(&self) -> ApiResult<Vec<SessionRecord>>;
     fn create_session(&self, request: CreateSession) -> ApiResult<SessionRecord>;
     fn get_session(&self, id: &str) -> ApiResult<SessionRecord>;
     fn status(&self, id: &str) -> ApiResult<SessionRecord>;
@@ -44,8 +43,6 @@ pub trait AgentHelmApi: Clone + Send + Sync + 'static {
     fn stop(&self, id: &str) -> ApiResult<SessionRecord>;
     fn restart(&self, id: &str) -> ApiResult<SessionRecord>;
     fn delete_session(&self, request: DeleteSessionRequest) -> ApiResult<DeletionResult>;
-    fn archive_session(&self, request: ArchiveSessionRequest) -> ApiResult<ArchiveSessionResult>;
-    fn restore_session(&self, id: &str) -> ApiResult<SessionRecord>;
     fn fork_session(&self, request: ForkSessionRequest) -> ApiResult<ForkSessionResult>;
     fn search_sessions(&self, query: &str, limit: usize) -> ApiResult<SessionSearchResponse>;
     fn events(&self, id: &str, since: i64, limit: usize) -> ApiResult<Vec<SessionEvent>>;
@@ -249,8 +246,6 @@ where
         .route("/api/sessions/:id/send", post(send::<C>))
         .route("/api/sessions/:id/output", get(output::<C>))
         .route("/api/sessions/:id/fork", post(fork_session::<C>))
-        .route("/api/sessions/:id/archive", post(archive_session::<C>))
-        .route("/api/sessions/:id/restore", post(restore_session::<C>))
         .route("/api/sessions/:id/start", post(restart::<C>))
         .route("/api/sessions/:id/stop", post(stop::<C>))
         .route("/api/sessions/:id/restart", post(restart::<C>))
@@ -486,10 +481,6 @@ struct AboutResponse {
 
 #[derive(Debug, Deserialize)]
 struct ListSessionsQuery {
-    #[serde(default)]
-    all: bool,
-    #[serde(default)]
-    archived: bool,
     group: Option<String>,
     status: Option<String>,
     deck_status: Option<String>,
@@ -549,8 +540,6 @@ struct EventsQuery {
 #[derive(Debug, Deserialize)]
 struct DeleteSessionQuery {
     #[serde(default)]
-    purge: bool,
-    #[serde(default)]
     cleanup_worktree: bool,
 }
 
@@ -563,14 +552,6 @@ struct ForkRequest {
     carry_state: bool,
     #[serde(default = "default_true")]
     start_immediately: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct ArchiveRequest {
-    archived_by: Option<String>,
-    reason: Option<String>,
-    #[serde(default = "default_true")]
-    stop_if_running: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -683,10 +664,6 @@ struct CostsQuery {
     model: Option<String>,
     start_at: Option<i64>,
     end_at: Option<i64>,
-    #[serde(default = "default_true")]
-    include_archived: bool,
-    #[serde(default)]
-    active_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -698,25 +675,9 @@ struct CostEventsQuery {
     model: Option<String>,
     start_at: Option<i64>,
     end_at: Option<i64>,
-    #[serde(default = "default_true")]
-    include_archived: bool,
-    #[serde(default)]
-    active_only: bool,
     #[serde(default)]
     offset: usize,
     limit: Option<usize>,
-}
-
-impl CostsQuery {
-    fn include_archived(&self) -> bool {
-        self.include_archived && !self.active_only
-    }
-}
-
-impl CostEventsQuery {
-    fn include_archived(&self) -> bool {
-        self.include_archived && !self.active_only
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -901,7 +862,6 @@ pre { margin: 0; padding: 10px; border: 1px solid var(--border); border-radius: 
       <label class="muted"><input name="force" type="checkbox"> Force</label>
       <button class="danger" type="submit">Delete Group</button>
     </form>
-<label class="muted"><input id="show-archived" type="checkbox"> Archived</label>
 <div id="fleet-summary" class="muted"></div>
  <ul id="sessions"></ul>
     </section>
@@ -918,13 +878,8 @@ pre { margin: 0; padding: 10px; border: 1px solid var(--border); border-radius: 
 <button id="restart" type="button">Restart</button>
 <button id="fork" type="button">Fork</button>
 <button id="sync-state" type="button">Sync State</button>
-<input id="archive-reason" placeholder="Archive reason">
-<input id="archive-by" placeholder="Archived by">
-<button id="archive" class="danger" type="button">Archive</button>
-<button id="restore" type="button">Restore</button>
 <button id="remove-session" class="danger" type="button">Remove</button>
 <label class="muted"><input id="remove-cleanup-worktree" type="checkbox"> Cleanup worktree</label>
-<label class="muted"><input id="remove-purge" type="checkbox"> Purge history</label>
 </div>
 </div>
 <form id="move-group-form" style="grid-template-columns: 1fr auto; margin-top: 10px">
@@ -1055,7 +1010,6 @@ pre { margin: 0; padding: 10px; border: 1px solid var(--border); border-radius: 
 <input name="model" placeholder="Cost model">
 <input name="start_at" placeholder="Start timestamp">
 <input name="end_at" placeholder="End timestamp">
-<label class="muted"><input name="include_archived" type="checkbox" checked> Include archived</label>
 <button type="submit">Apply Costs</button>
 </form>
 <form id="cost-record-form" style="grid-template-columns: repeat(6, minmax(0, 1fr)) auto; margin-top: 10px">
@@ -1098,7 +1052,6 @@ pre { margin: 0; padding: 10px; border: 1px solid var(--border); border-radius: 
 <div class="shortcut-row"><span><span class="kbd">?</span></span><span>Keyboard shortcuts</span></div>
 <div class="shortcut-row"><span><span class="kbd">j</span> / <span class="kbd">k</span></span><span>Next / previous session</span></div>
 <div class="shortcut-row"><span><span class="kbd">Enter</span></span><span>Open selected session</span></div>
-<div class="shortcut-row"><span><span class="kbd">a</span></span><span>Toggle archived sessions</span></div>
 <div class="shortcut-row"><span><span class="kbd">t</span></span><span>Cycle status filter</span></div>
 <div class="shortcut-row"><span><span class="kbd">/</span></span><span>Focus search</span></div>
 <div class="shortcut-row"><span><span class="kbd">n</span></span><span>New session</span></div>
@@ -1211,12 +1164,6 @@ function closeShortcutHelp() {
 $("shortcut-help").hidden = true;
 }
 const statusFilterOrder = ["", "running", "queued", "waiting", "idle", "starting", "stopped", "errored"];
-function toggleArchivedFilter() {
-const checkbox = $("show-archived");
-checkbox.checked = !checkbox.checked;
-clearSelectedSession();
-loadSessions();
-}
 function cycleStatusFilter() {
 const select = $("status-filter");
 const index = statusFilterOrder.indexOf(select.value);
@@ -1614,7 +1561,6 @@ if (!session) return "";
 const parts = [session.agent, session.group_name, session.project_path].filter(Boolean);
 if (session.workspace_id) parts.push(`workspace ${shortId(session.workspace_id)}`);
 if (session.worktree_id) parts.push(`worktree ${shortId(session.worktree_id)}`);
-if (session.archived) parts.push("archived");
 return parts.join(" · ");
 }
 const fleetStatusOrder = ["running", "queued", "waiting", "idle", "starting", "stopped", "errored"];
@@ -1828,7 +1774,7 @@ pushSessionRoute(null);
 function setReadOnly(value) {
   readOnly = value;
   $("mode").textContent = value ? "read-only" : "read/write";
-document.querySelectorAll("#new-session input, #new-session select, #new-session button, #project-add-form input, #project-add-form button, #send-form input, #send-form button, #session-event-form input, #session-event-form select, #session-event-form button, #move-group-form input, #move-group-form button, #fork-form input, #fork-form button, #project-form button, #worktree-create-form input, #worktree-create-form button, #worktree-finish-form input, #worktree-finish-form button, #group-create-form input, #group-create-form button, #group-update-form input, #group-update-form select, #group-update-form button, #group-delete-form input, #group-delete-form button, #mcp-form input, #mcp-form select, #mcp-form button, #skill-form input, #skill-form select, #skill-form button, #watcher-create-form input, #watcher-create-form select, #watcher-create-form button, #watcher-form input, #watcher-form button, #watcher-ingest-form input, #watcher-ingest-form select, #watcher-ingest-form button, #watcher-poll-all-form button, #cost-record-form input, #cost-record-form button, #conductor-form button, #conductor-action-form input[name='task'], #conductor-start, #conductor-heartbeat, #conductor-send, #conductor-stop, #conductor-remove, #conductor-assignment-status-form input, #conductor-assignment-status-form button, #start, #stop, #restart, #fork, #sync-state, #archive-reason, #archive-by, #archive, #restore, #remove-session, #remove-cleanup-worktree, #remove-purge")
+document.querySelectorAll("#new-session input, #new-session select, #new-session button, #project-add-form input, #project-add-form button, #send-form input, #send-form button, #session-event-form input, #session-event-form select, #session-event-form button, #move-group-form input, #move-group-form button, #fork-form input, #fork-form button, #project-form button, #worktree-create-form input, #worktree-create-form button, #worktree-finish-form input, #worktree-finish-form button, #group-create-form input, #group-create-form button, #group-update-form input, #group-update-form select, #group-update-form button, #group-delete-form input, #group-delete-form button, #mcp-form input, #mcp-form select, #mcp-form button, #skill-form input, #skill-form select, #skill-form button, #watcher-create-form input, #watcher-create-form select, #watcher-create-form button, #watcher-form input, #watcher-form button, #watcher-ingest-form input, #watcher-ingest-form select, #watcher-ingest-form button, #watcher-poll-all-form button, #cost-record-form input, #cost-record-form button, #conductor-form button, #conductor-action-form input[name='task'], #conductor-start, #conductor-heartbeat, #conductor-send, #conductor-stop, #conductor-remove, #conductor-assignment-status-form input, #conductor-assignment-status-form button, #start, #stop, #restart, #fork, #sync-state, #remove-session, #remove-cleanup-worktree")
 .forEach((item) => item.disabled = value);
 }
 function canWrite() {
@@ -1861,10 +1807,9 @@ setStatus(err.message);
 }
 }
 async function loadSessions() {
-  searchActive = false;
+searchActive = false;
 try {
 const params = new URLSearchParams();
-if ($("show-archived").checked) params.set("archived", "true");
 const group = $("group-filter").value.trim();
 if (group) params.set("group", group);
 const status = $("status-filter").value;
@@ -1973,14 +1918,9 @@ async function loadPanel() {
           const value = form.get(key).trim();
           if (value) params.set(key, value);
         }
-        const hasExplicitCostFilter = costFilterKeys.some((key) => params.has(key));
-        if (selected && !hasExplicitCostFilter) params.set("session_id", selected);
-        if (form.has("include_archived")) {
-          params.set("include_archived", "true");
-        } else {
-          params.set("active_only", "true");
-        }
-      const [summary, events] = await Promise.all([
+const hasExplicitCostFilter = costFilterKeys.some((key) => params.has(key));
+if (selected && !hasExplicitCostFilter) params.set("session_id", selected);
+const [summary, events] = await Promise.all([
         api(`/api/costs?${params.toString()}`),
         api(`/api/cost-events?${params.toString()}`),
       ]);
@@ -2055,10 +1995,6 @@ setStatus(err.message);
 }
 }
 $("refresh").onclick = refreshDashboard;
-$("show-archived").onchange = () => {
-clearSelectedSession();
-loadSessions();
-};
 $("command-palette").onclick = closeCommandPalette;
 $("palette-panel").onclick = (event) => event.stopPropagation();
 $("palette-input").oninput = renderCommandPalette;
@@ -2549,34 +2485,20 @@ body: JSON.stringify({status})
 tab = "managers";
 event.target.reset();
 };
-for (const id of ["start", "stop", "restart", "fork", "sync-state", "archive", "restore"]) {
+for (const id of ["start", "stop", "restart", "fork", "sync-state"]) {
 $(id).onclick = async () => {
 if (!canWrite()) return;
 if (!selected) return;
 const body = {};
-    if (id === "archive") {
-      const reason = $("archive-reason").value.trim();
-      const archivedBy = $("archive-by").value.trim();
-if (reason) body.reason = reason;
-if (archivedBy) body.archived_by = archivedBy;
-}
 const sessionId = selected;
 const runAction = async () => {
 const result = await api(`/api/sessions/${sessionId}/${id}`, {method: "POST", body: JSON.stringify(body)});
 if (id === "fork") selected = result.child_session_id;
 if (id === "sync-state") setStatus(result.synced ? `synced ${result.source}` : `no ${result.source} update`);
-if (id === "archive") {
-$("archive-reason").value = "";
-      $("archive-by").value = "";
-    }
 await loadSessions();
 if (selected) await loadSelectedSnapshot(selected);
 await loadPanel();
 };
-if (id === "archive") {
-confirmAction(`Archive session ${sessionId}?`, runAction);
-return;
-}
 await runAction();
 };
 }
@@ -2585,12 +2507,10 @@ if (!canWrite()) return;
 if (!selected) return;
 const sessionId = selected;
 const cleanup = $("remove-cleanup-worktree").checked;
-const purge = $("remove-purge").checked;
-const suffix = purge ? "?purge=true" : (cleanup ? "?cleanup_worktree=true" : "");
+const suffix = cleanup ? "?cleanup_worktree=true" : "";
 confirmAction(`Remove session ${sessionId}?`, async () => {
 await api(`/api/sessions/${sessionId}${suffix}`, {method: "DELETE"});
 $("remove-cleanup-worktree").checked = false;
-$("remove-purge").checked = false;
 if (selected === sessionId) clearSelectedSession();
 await loadSessions();
 await loadPanel();
@@ -2643,11 +2563,6 @@ if (!typing && event.key === "Enter") {
 event.preventDefault();
 if (event.shiftKey) openSelectedSessionInNewTab();
 else openSelectedSession();
-return;
-}
-if (!typing && event.key.toLowerCase() === "a") {
-event.preventDefault();
-toggleArchivedFilter();
 return;
 }
 if (!typing && event.key.toLowerCase() === "t") {
@@ -2737,13 +2652,7 @@ where
     let status = query.status.as_deref().map(normalize_status_filter);
     let deck_status = query.deck_status.as_deref().map(normalize_status_filter);
     let mut sessions = Vec::new();
-    for session in state
-        .controller
-        .list_sessions(query.all || query.archived)?
-    {
-        if query.archived && !session.archived {
-            continue;
-        }
+    for session in state.controller.list_sessions()? {
         if query
             .group
             .as_deref()
@@ -2897,9 +2806,7 @@ async fn delete_session<C>(
 where
     C: AgentHelmApi,
 {
-    let mode = if query.purge {
-        DeleteMode::Purge
-    } else if query.cleanup_worktree {
+    let mode = if query.cleanup_worktree {
         DeleteMode::CleanupWorktree
     } else {
         DeleteMode::MetadataOnly
@@ -2930,36 +2837,6 @@ where
         carry_state: request.carry_state,
         start_immediately: request.start_immediately,
     })?))
-}
-
-async fn archive_session<C>(
-    State(state): State<ApiState<C>>,
-    _writable: Writable,
-    Path(id): Path<String>,
-    Json(request): Json<ArchiveRequest>,
-) -> ApiResult<Json<ArchiveSessionResult>>
-where
-    C: AgentHelmApi,
-{
-    Ok(Json(state.controller.archive_session(
-        ArchiveSessionRequest {
-            session_id: id,
-            archived_by: request.archived_by.unwrap_or_else(|| "api".to_string()),
-            reason: request.reason.unwrap_or_default(),
-            stop_if_running: request.stop_if_running,
-        },
-    )?))
-}
-
-async fn restore_session<C>(
-    State(state): State<ApiState<C>>,
-    _writable: Writable,
-    Path(id): Path<String>,
-) -> ApiResult<Json<SessionRecord>>
-where
-    C: AgentHelmApi,
-{
-    Ok(Json(state.controller.restore_session(&id)?))
 }
 
 async fn diff<C>(
@@ -3805,7 +3682,6 @@ where
     C: AgentHelmApi,
 {
     let now = now_ts();
-    let include_archived = query.include_archived();
     Ok(Json(state.controller.cost_summary(CostFilter {
         profile: String::new(),
         project_id: query.project_id,
@@ -3815,7 +3691,6 @@ where
         model: query.model,
         start_at: query.start_at.unwrap_or(0),
         end_at: query.end_at.unwrap_or(now),
-        include_archived,
     })?))
 }
 
@@ -3827,7 +3702,6 @@ where
     C: AgentHelmApi,
 {
     let now = now_ts();
-    let include_archived = query.include_archived();
     Ok(Json(state.controller.cost_events(
         CostFilter {
             profile: String::new(),
@@ -3838,7 +3712,6 @@ where
             model: query.model,
             start_at: query.start_at.unwrap_or(0),
             end_at: query.end_at.unwrap_or(now),
-            include_archived,
         },
         query.offset,
         query.limit.unwrap_or(50),
@@ -3864,27 +3737,6 @@ mod tests {
 
         assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(error.code, "internal_error");
-    }
-
-    #[test]
-    fn cost_queries_include_archived_by_default_with_active_only_override() {
-        let costs: CostsQuery = serde_json::from_value(serde_json::json!({})).unwrap();
-        assert!(costs.include_archived());
-
-        let explicit_active: CostsQuery =
-            serde_json::from_value(serde_json::json!({"include_archived": false})).unwrap();
-        assert!(!explicit_active.include_archived());
-
-        let active_only: CostsQuery =
-            serde_json::from_value(serde_json::json!({"active_only": true})).unwrap();
-        assert!(!active_only.include_archived());
-
-        let events: CostEventsQuery = serde_json::from_value(serde_json::json!({})).unwrap();
-        assert!(events.include_archived());
-
-        let active_only_events: CostEventsQuery =
-            serde_json::from_value(serde_json::json!({"active_only": true})).unwrap();
-        assert!(!active_only_events.include_archived());
     }
 
     #[test]

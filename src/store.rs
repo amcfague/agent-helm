@@ -346,21 +346,13 @@ impl SessionStore {
         })
     }
 
-    pub fn list_sessions(&self, include_archived: bool) -> Result<Vec<SessionRecord>> {
+    pub fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
         let conn = self.connect()?;
-        if include_archived {
-            self.query_sessions(
-                &conn,
-                "SELECT * FROM sessions ORDER BY updated_at DESC, created_at DESC",
-                [],
-            )
-        } else {
-            self.query_sessions(
-                &conn,
-                "SELECT * FROM sessions WHERE archived = 0 ORDER BY updated_at DESC, created_at DESC",
-                [],
-            )
-        }
+        self.query_sessions(
+            &conn,
+            "SELECT * FROM sessions ORDER BY updated_at DESC, created_at DESC",
+            [],
+        )
     }
 
     pub fn get_session(&self, id: &str) -> Result<SessionRecord> {
@@ -661,73 +653,6 @@ impl SessionStore {
     }
 
     pub fn remove_session(&self, id: &str) -> Result<()> {
-        self.with_transaction(|tx| {
-            let related_rows: i64 = tx.query_row(
-                r#"
-                SELECT
-                    (SELECT COUNT(*) FROM session_events WHERE session_id = ?1) +
-                    (SELECT COUNT(*) FROM cost_events WHERE session_id = ?1)
-                "#,
-                params![id],
-                |row| row.get(0),
-            )?;
-
-            let changed = if related_rows == 0 {
-                tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])?
-            } else {
-                let changed = tx.execute(
-                    "UPDATE sessions SET archived = 1, status = ?3, runtime_id = NULL, version = version + 1, updated_at = ?2 WHERE id = ?1",
-                    params![id, now_ts(), SessionStatus::Stopped.as_str()],
-                )?;
-                if changed > 0 {
-                    tx.execute(
-                        "INSERT INTO session_events (session_id, kind, payload, created_at) VALUES (?1, ?2, ?3, ?4)",
-                        params![
-                            id,
-                            "archive",
-                            serde_json::to_string(&json!({ "source": "remove_session" }))?,
-                            now_ts()
-                        ],
-                    )?;
-                }
-                changed
-            };
-
-            ensure_changed(changed, "session not found", id)
-        })
-    }
-
-    pub fn archive_session(&self, id: &str) -> Result<SessionRecord> {
-        self.with_transaction(|tx| {
-            let changed = tx.execute(
-                r#"
-                UPDATE sessions
-                SET archived = 1, version = version + 1, updated_at = ?2
-                WHERE id = ?1
-                "#,
-                params![id, now_ts()],
-            )?;
-            ensure_changed(changed, "session not found", id)?;
-            Self::get_session_in(tx, id)
-        })
-    }
-
-    pub fn restore_session(&self, id: &str) -> Result<SessionRecord> {
-        self.with_transaction(|tx| {
-            let changed = tx.execute(
-                r#"
-                UPDATE sessions
-                SET archived = 0, version = version + 1, updated_at = ?2
-                WHERE id = ?1
-                "#,
-                params![id, now_ts()],
-            )?;
-            ensure_changed(changed, "session not found", id)?;
-            Self::get_session_in(tx, id)
-        })
-    }
-
-    pub fn purge_session(&self, id: &str) -> Result<()> {
         self.with_transaction(|tx| {
             let changed = tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
             ensure_changed(changed, "session not found", id)
@@ -1483,7 +1408,6 @@ impl SessionStore {
               AND (?4 IS NULL OR s.group_name = ?4)
               AND (?5 IS NULL OR ce.session_id = ?5)
               AND (?6 IS NULL OR s.agent = ?6)
-              AND (?7 = 1 OR s.archived = 0)
             ORDER BY ce.created_at ASC
             "#,
         )?;
@@ -1495,7 +1419,6 @@ impl SessionStore {
                 filter.group_name.as_deref(),
                 filter.session_id.as_deref(),
                 filter.agent.as_deref(),
-                bool_to_int(filter.include_archived),
             ],
             |row| {
                 let payload: String = row.get(2)?;
@@ -1577,7 +1500,6 @@ impl SessionStore {
               AND (?4 IS NULL OR s.group_name = ?4)
               AND (?5 IS NULL OR ce.session_id = ?5)
               AND (?6 IS NULL OR s.agent = ?6)
-              AND (?7 = 1 OR s.archived = 0)
             ORDER BY ce.created_at DESC, ce.id DESC
             "#,
         )?;
@@ -1589,7 +1511,6 @@ impl SessionStore {
                 filter.group_name.as_deref(),
                 filter.session_id.as_deref(),
                 filter.agent.as_deref(),
-                bool_to_int(filter.include_archived),
             ],
             |row| {
                 let payload: String = row.get("payload")?;
@@ -2355,7 +2276,6 @@ mod tests {
             model: Some("gpt-5".into()),
             start_at: now,
             end_at: now_ts(),
-            include_archived: false,
         })?;
         assert_eq!(summary.total_cost_micros, 12345);
         assert_eq!(summary.event_count, 1);
@@ -2371,7 +2291,6 @@ mod tests {
                 model: Some("gpt-5".into()),
                 start_at: now,
                 end_at: now_ts(),
-                include_archived: false,
             },
             0,
             10,
