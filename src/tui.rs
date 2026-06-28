@@ -8,8 +8,8 @@ use crate::{
 };
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-        MouseButton, MouseEvent, MouseEventKind,
+        self, DisableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     },
     execute,
     terminal::{
@@ -514,11 +514,7 @@ where
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     enable_raw_mode()?;
-    if let Err(err) = execute!(
-        terminal.backend_mut(),
-        EnterAlternateScreen,
-        EnableMouseCapture
-    ) {
+    if let Err(err) = execute!(terminal.backend_mut(), EnterAlternateScreen) {
         let _ = disable_raw_mode();
         return Err(err.into());
     }
@@ -3376,20 +3372,53 @@ where
         return Ok(());
     };
     let selected_session_id = session_id.clone();
-    match handle_action(build(session_id)) {
+    let action = build(session_id);
+    let target_session_id = match &action {
+        TuiAction::Remove { .. } => delete_selection_target(app, &selected_session_id),
+        _ => Some(selected_session_id.clone()),
+    };
+    match handle_action(action) {
         Ok(sessions) => {
             app.sessions = sessions;
             invalidate_session_cache(app, &selected_session_id);
             if app.search_results_active && !app.query.trim().is_empty() {
                 refresh_sessions(app, handle_action)?;
             }
-            select_matching_session(app, |session| session.id == selected_session_id);
+            if let Some(target_session_id) = target_session_id {
+                select_matching_session(app, |session| session.id == target_session_id);
+            } else {
+                select_matching_session(app, |_| false);
+            }
             app.detail_scroll = 0;
             app.status_message = Some(done.to_string());
         }
         Err(err) => app.status_message = Some(format!("{done} failed: {err}")),
     }
     Ok(())
+}
+
+fn delete_selection_target(app: &App, session_id: &str) -> Option<String> {
+    let view = app.view();
+    let index = view
+        .visible_sessions
+        .iter()
+        .position(|session| session.id == session_id)?;
+    let group_name = view.visible_sessions[index].group_name.as_str();
+    let first_in_group =
+        index == 0 || view.visible_sessions[index - 1].group_name.as_str() != group_name;
+    let target = if first_in_group {
+        view.visible_sessions.get(index + 1).or_else(|| {
+            index
+                .checked_sub(1)
+                .and_then(|index| view.visible_sessions.get(index))
+        })
+    } else {
+        index
+            .checked_sub(1)
+            .and_then(|index| view.visible_sessions.get(index))
+            .or_else(|| view.visible_sessions.get(index + 1))
+    };
+    target.map(|session| session.id.clone())
 }
 
 fn selected_id(app: &App) -> Option<String> {
@@ -4939,6 +4968,80 @@ mod tests {
         assert_eq!(view.visible_count, 1);
         assert_eq!(view.selected.unwrap().id, "1");
         assert_eq!(app.status_message.as_deref(), Some("stopped"));
+    }
+
+    #[test]
+    fn delete_selects_next_when_selected_is_first_in_group() {
+        let mut app = test_app(vec![
+            record("1", "ops", "deploy", false),
+            record("2", "ops", "logs", false),
+        ]);
+        app.selected_index = 0;
+        let mut deleted = false;
+        let remaining = vec![record("2", "ops", "logs", false)];
+        let mut handle = |action| match action {
+            TuiAction::Remove { session_id, mode } => {
+                deleted = session_id == "1" && mode == DeleteMode::MetadataOnly;
+                Ok(remaining.clone())
+            }
+            _ => Ok(Vec::new()),
+        };
+
+        run_selected_action(
+            &mut app,
+            &mut handle,
+            |session_id| TuiAction::Remove {
+                session_id,
+                mode: DeleteMode::MetadataOnly,
+            },
+            "deleted",
+        )
+        .unwrap();
+
+        let view = app.view();
+        assert!(deleted);
+        assert_eq!(view.selected.unwrap().id, "2");
+        assert_eq!(app.status_message.as_deref(), Some("deleted"));
+    }
+
+    #[test]
+    fn delete_selects_previous_when_selected_is_not_first_in_group() {
+        let mut app = test_app(vec![
+            record("1", "ops", "deploy", false),
+            record("2", "ops", "logs", false),
+            record("3", "ops", "review", false),
+        ]);
+        app.selected_index = 1;
+        let remaining = vec![
+            record("1", "ops", "deploy", false),
+            record("3", "ops", "review", false),
+        ];
+        let mut handle = |action| match action {
+            TuiAction::Remove { session_id, mode } => {
+                assert_eq!(session_id, "2");
+                assert_eq!(mode, DeleteMode::CleanupWorktree);
+                Ok(remaining.clone())
+            }
+            _ => Ok(Vec::new()),
+        };
+
+        run_selected_action(
+            &mut app,
+            &mut handle,
+            |session_id| TuiAction::Remove {
+                session_id,
+                mode: DeleteMode::CleanupWorktree,
+            },
+            "deleted and cleaned up",
+        )
+        .unwrap();
+
+        let view = app.view();
+        assert_eq!(view.selected.unwrap().id, "1");
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("deleted and cleaned up")
+        );
     }
 
     #[test]
