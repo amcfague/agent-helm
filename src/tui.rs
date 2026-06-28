@@ -1427,13 +1427,27 @@ impl GroupField {
             Self::DefaultPath => "Default working dir",
         }
     }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Name => Self::DefaultPath,
+            Self::DefaultPath => Self::DefaultPath,
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            Self::Name => Self::Name,
+            Self::DefaultPath => Self::Name,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GroupForm {
     name: String,
     default_project_path: String,
-    field_index: usize,
+    current_field: GroupField,
 }
 
 impl GroupForm {
@@ -1441,16 +1455,16 @@ impl GroupForm {
         Self {
             name: String::new(),
             default_project_path: default_new_session_path(),
-            field_index: 0,
+            current_field: GroupField::Name,
         }
     }
 
     fn current_field(&self) -> GroupField {
-        GROUP_FIELDS[self.field_index]
+        self.current_field
     }
 
     fn current_value_mut(&mut self) -> &mut String {
-        match self.current_field() {
+        match self.current_field {
             GroupField::Name => &mut self.name,
             GroupField::DefaultPath => &mut self.default_project_path,
         }
@@ -1464,11 +1478,11 @@ impl GroupForm {
     }
 
     fn next_field(&mut self) {
-        self.field_index = (self.field_index + 1).min(GROUP_FIELDS.len() - 1);
+        self.current_field = self.current_field.next();
     }
 
     fn previous_field(&mut self) {
-        self.field_index = self.field_index.saturating_sub(1);
+        self.current_field = self.current_field.previous();
     }
 }
 
@@ -1845,9 +1859,9 @@ fn group_default_path<'a>(
     group_name: &str,
 ) -> Option<&'a str> {
     group_default_paths
-        .get(group_name.trim())
+        .get(group_name)
         .map(String::as_str)
-        .filter(|path| !path.trim().is_empty())
+        .filter(|path| !path.is_empty())
 }
 
 fn group_names(group_default_paths: &BTreeMap<String, String>) -> Vec<String> {
@@ -1855,7 +1869,7 @@ fn group_names(group_default_paths: &BTreeMap<String, String>) -> Vec<String> {
 }
 
 fn select_existing_group(group_name: &mut String, group_default_paths: &BTreeMap<String, String>) {
-    if group_default_paths.contains_key(group_name.trim()) {
+    if group_default_paths.contains_key(group_name.as_str()) {
         return;
     }
     *group_name = group_default_paths
@@ -1870,17 +1884,17 @@ fn cycle_group_name(
     group_default_paths: &BTreeMap<String, String>,
     delta: isize,
 ) {
-    let groups = group_names(group_default_paths);
-    if groups.is_empty() {
+    let len = group_default_paths.len();
+    if len == 0 {
         group_name.clear();
         return;
     }
-    let current = groups
-        .iter()
-        .position(|group| group == group_name)
+    let current = group_default_paths
+        .keys()
+        .position(|k| k == group_name)
         .unwrap_or(0);
-    let next = (current as isize + delta).rem_euclid(groups.len() as isize) as usize;
-    *group_name = groups[next].clone();
+    let next = (current as isize + delta).rem_euclid(len as isize) as usize;
+    *group_name = group_default_paths.keys().nth(next).unwrap().clone();
 }
 
 fn apply_group_default_path(
@@ -3076,7 +3090,7 @@ where
             KeyCode::Tab | KeyCode::Down => form.next_field(),
             KeyCode::BackTab | KeyCode::Up => form.previous_field(),
             KeyCode::Enter => {
-                if form.field_index == GROUP_FIELDS.len() - 1 {
+                if form.current_field() == *GROUP_FIELDS.last().unwrap() {
                     submit = true;
                 } else {
                     form.next_field();
