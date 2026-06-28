@@ -54,6 +54,8 @@ const PREVIEW_MAX_SCROLL_LINES: u16 = 5000;
 const EMBED_READ_BUF_SIZE: usize = 8192;
 const EMBED_MIN_ROWS: u16 = 2;
 const EMBED_MIN_COLS: u16 = 10;
+const SGR_MOUSE_WHEEL_UP: u8 = 64;
+const SGR_MOUSE_WHEEL_DOWN: u8 = 65;
 const DEFAULT_SIDEBAR_PERCENT: u16 = 24;
 const MIN_SIDEBAR_PERCENT: u16 = 18;
 const MAX_SIDEBAR_PERCENT: u16 = 50;
@@ -823,6 +825,7 @@ impl EmbeddedTmux {
         let rows = rows.max(EMBED_MIN_ROWS);
         let cols = cols.max(EMBED_MIN_COLS);
         reset_tmux_window_size(&target);
+        enable_tmux_mouse(&target)?;
 
         let pty = native_pty_system();
         let pair = pty
@@ -924,12 +927,19 @@ impl EmbeddedTmux {
 
     fn write_key(&mut self, key: KeyEvent) -> Result<()> {
         if let Some(bytes) = encode_embedded_key(key, self.parser.screen().application_cursor()) {
+            self.write_bytes(&bytes)?;
+        }
+        Ok(())
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        if !bytes.is_empty() {
             self.writer
-                .write_all(&bytes)
-                .map_err(|err| AppError::msg(format!("write embedded terminal key: {err}")))?;
+                .write_all(bytes)
+                .map_err(|err| AppError::msg(format!("write embedded terminal input: {err}")))?;
             self.writer
                 .flush()
-                .map_err(|err| AppError::msg(format!("flush embedded terminal key: {err}")))?;
+                .map_err(|err| AppError::msg(format!("flush embedded terminal input: {err}")))?;
         }
         Ok(())
     }
@@ -1091,6 +1101,22 @@ fn reset_tmux_window_size(target: &str) {
         .arg("window-size")
         .arg("latest")
         .status();
+}
+
+fn enable_tmux_mouse(target: &str) -> Result<()> {
+    let status = Command::new("tmux")
+        .arg("set-option")
+        .arg("-t")
+        .arg(target)
+        .arg("mouse")
+        .arg("on")
+        .status()
+        .map_err(|err| AppError::msg(format!("enable tmux mouse: {err}")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(AppError::msg(format!("enable tmux mouse: {status}")))
+    }
 }
 
 fn sync_tmux_preview_window_size(target: &str, rows: u16, cols: u16) {
@@ -2293,6 +2319,12 @@ where
 
 fn process_mouse(app: &mut App, mouse: MouseEvent, area: Rect) -> bool {
     match mouse.kind {
+        MouseEventKind::ScrollUp if mouse_on_embedded_session(mouse, area, app) => {
+            scroll_embedded_session(app, mouse, area)
+        }
+        MouseEventKind::ScrollDown if mouse_on_embedded_session(mouse, area, app) => {
+            scroll_embedded_session(app, mouse, area)
+        }
         MouseEventKind::ScrollUp if mouse_on_session_preview(mouse, area, app) => {
             scroll_session_preview(app, PREVIEW_SCROLL_LINES as i16)
         }
@@ -2313,6 +2345,43 @@ fn process_mouse(app: &mut App, mouse: MouseEvent, area: Rect) -> bool {
         }
         _ => false,
     }
+}
+
+fn scroll_embedded_session(app: &mut App, mouse: MouseEvent, area: Rect) -> bool {
+    let terminal_area = embedded_terminal_area(
+        ratatui::layout::Size {
+            width: area.width,
+            height: area.height,
+        },
+        app.sidebar_percent,
+    );
+    let Some(bytes) = encode_embedded_mouse_wheel(mouse, terminal_area) else {
+        return false;
+    };
+    let Some(embedded) = app.embedded.as_mut() else {
+        return false;
+    };
+    match embedded.write_bytes(&bytes) {
+        Ok(()) => true,
+        Err(err) => {
+            app.status_message = Some(format!("scroll failed: {err}"));
+            false
+        }
+    }
+}
+
+fn encode_embedded_mouse_wheel(mouse: MouseEvent, area: Rect) -> Option<Vec<u8>> {
+    if !point_in_rect(mouse.column, mouse.row, area) {
+        return None;
+    }
+    let button = match mouse.kind {
+        MouseEventKind::ScrollUp => SGR_MOUSE_WHEEL_UP,
+        MouseEventKind::ScrollDown => SGR_MOUSE_WHEEL_DOWN,
+        _ => return None,
+    };
+    let column = mouse.column - area.x + 1;
+    let row = mouse.row - area.y + 1;
+    Some(format!("\x1b[<{button};{column};{row}M").into_bytes())
 }
 
 fn scroll_session_preview(app: &mut App, delta: i16) -> bool {
@@ -3217,6 +3286,20 @@ fn mouse_on_session_preview(mouse: MouseEvent, area: Rect, app: &App) -> bool {
     point_in_rect(mouse.column, mouse.row, preview)
 }
 
+fn mouse_on_embedded_session(mouse: MouseEvent, area: Rect, app: &App) -> bool {
+    if !matches!(app.mode, Mode::Session(_)) || app.embedded.is_none() {
+        return false;
+    }
+    let embedded = embedded_terminal_area(
+        ratatui::layout::Size {
+            width: area.width,
+            height: area.height,
+        },
+        app.sidebar_percent,
+    );
+    point_in_rect(mouse.column, mouse.row, embedded)
+}
+
 fn point_in_rect(column: u16, row: u16, area: Rect) -> bool {
     row >= area.y
         && row < area.y.saturating_add(area.height)
@@ -3513,7 +3596,15 @@ fn render_session_terminal(frame: &mut Frame<'_>, app: &App, view: &DashboardVie
         .as_ref()
         .map(|session| format!("SESSION {}", session.name))
         .unwrap_or_else(|| "SESSION".to_string());
-    let block = panel_block_owned(title);
+    let block = if view
+        .selected
+        .as_ref()
+        .is_some_and(|session| session_is_live(session.status))
+    {
+        panel_block_owned(title).border_style(active_border_style())
+    } else {
+        panel_block_owned(title)
+    };
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -3870,6 +3961,10 @@ fn selected_row_style() -> Style {
 
 fn border_style() -> Style {
     Style::default().fg(Color::Rgb(118, 126, 148))
+}
+
+fn active_border_style() -> Style {
+    Style::default().fg(Color::Rgb(255, 212, 96))
 }
 
 fn muted_style() -> Style {
@@ -6107,6 +6202,30 @@ mod tests {
     }
 
     #[test]
+    fn render_session_terminal_highlights_live_session_border() {
+        let backend = ratatui::backend::TestBackend::new(100, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
+        app.mode = Mode::Session(SendForm::default());
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        let inner = embedded_terminal_area(
+            ratatui::layout::Size {
+                width: 100,
+                height: 18,
+            },
+            app.sidebar_percent,
+        );
+        let border_cell = terminal
+            .backend()
+            .buffer()
+            .cell((inner.x.saturating_sub(1), inner.y.saturating_sub(1)))
+            .unwrap();
+        assert_eq!(Some(border_cell.fg), active_border_style().fg);
+    }
+
+    #[test]
     fn render_session_terminal_does_not_mirror_long_output() {
         let backend = ratatui::backend::TestBackend::new(100, 12);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -6431,6 +6550,48 @@ mod tests {
         assert!(!changed);
         assert!(!app.resizing_sidebar);
         assert_eq!(app.sidebar_percent, DEFAULT_SIDEBAR_PERCENT);
+    }
+
+    #[test]
+    fn embedded_mouse_wheel_encodes_sgr_coordinates_relative_to_terminal() {
+        let area = Rect::new(10, 4, 20, 8);
+
+        let up = encode_embedded_mouse_wheel(
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 12,
+                row: 7,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        )
+        .unwrap();
+        assert_eq!(up, b"\x1b[<64;3;4M");
+
+        let down = encode_embedded_mouse_wheel(
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 10,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        )
+        .unwrap();
+        assert_eq!(down, b"\x1b[<65;1;1M");
+
+        assert!(
+            encode_embedded_mouse_wheel(
+                MouseEvent {
+                    kind: MouseEventKind::ScrollUp,
+                    column: 9,
+                    row: 7,
+                    modifiers: KeyModifiers::NONE,
+                },
+                area,
+            )
+            .is_none()
+        );
     }
 
     #[test]

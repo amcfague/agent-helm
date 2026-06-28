@@ -12,8 +12,12 @@ use std::{
 };
 
 const TMUX_DETACH_KEY: &str = "C-q";
-const TMUX_SESSION_OPTIONS: &[(&str, &str)] =
-    &[("status", "off"), ("prefix", "None"), ("prefix2", "None")];
+const TMUX_SESSION_OPTIONS: &[(&str, &str)] = &[
+    ("status", "off"),
+    ("prefix", "None"),
+    ("prefix2", "None"),
+    ("mouse", "on"),
+];
 const TMUX_WINDOW_OPTIONS: &[(&str, &str)] = &[("pane-border-status", "off")];
 
 pub trait SessionRuntime: Clone + Send + Sync + 'static {
@@ -191,12 +195,11 @@ impl SessionRuntime for TmuxRuntime {
     }
 
     fn attach(&self, session_id: &str) -> Result<()> {
+        let tmux_id = tmux_session_name(session_id);
+        configure_tmux_viewport(&tmux_id)?;
         let hotkey = TmuxDetachHotkey::install()?;
         let mut command = tmux();
-        command
-            .arg("attach-session")
-            .arg("-t")
-            .arg(tmux_session_name(session_id));
+        command.arg("attach-session").arg("-t").arg(tmux_id);
         let attach_result = run_tmux_status(command);
         let restore_result = hotkey.restore();
         match (attach_result, restore_result) {
@@ -603,6 +606,7 @@ mod tests {
         assert!(TMUX_SESSION_OPTIONS.contains(&("status", "off")));
         assert!(TMUX_SESSION_OPTIONS.contains(&("prefix", "None")));
         assert!(TMUX_SESSION_OPTIONS.contains(&("prefix2", "None")));
+        assert!(TMUX_SESSION_OPTIONS.contains(&("mouse", "on")));
         assert!(TMUX_WINDOW_OPTIONS.contains(&("pane-border-status", "off")));
     }
 

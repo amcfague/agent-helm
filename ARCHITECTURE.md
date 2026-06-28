@@ -1,487 +1,898 @@
 # Agent Helm Architecture
 
-Agent Helm is a local AI session command center for developers who run many terminal-native agents at once. It combines the broad product behavior of `agent-deck` with the cleaner maintainability patterns of `agent-of-empires`, while leaving the implementation language and UI toolkit open.
+Agent Helm is a local command center for long-running, terminal-backed agent
+sessions. It lets one developer create, group, inspect, fork, stop, archive, and
+coordinate many agent processes without making the UI process the owner of those
+processes.
 
-This document began as architecture only. The repo now includes a Rust
-implementation for the first local-controller milestone; broader product items
-below are backlog unless the README names them as current scope.
+The application is local-first:
 
-## Product Goals
+- The durable state lives in a per-profile SQLite database.
+- The session runtime is tmux, so sessions survive UI exits and SSH disconnects.
+- All user-facing surfaces call the same controller.
+- The terminal UI and browser UI are clients of local state and runtime control;
+  neither owns session lifecycle logic.
 
-- Fast local command center for AI coding sessions across projects, agents, groups, and worktrees.
-- Terminal-native first: CLI and TUI must be complete surfaces, not thin launchers for a web app.
-- Web UI as a companion surface for browser terminals, structured agent views, diffs, and phone access.
-- Local-first storage and runtime: sessions continue running when the UI exits.
-- Maintainable internals: one controller, explicit storage contracts, narrow adapters, and testable lifecycle flows.
-- Safe by default around project hooks, sandbox paths, web access, remote events, and secrets.
+This document describes the current implementation, not a future product sketch.
+Use it as the map for reproducing Agent Helm without rediscovering the runtime,
+storage, terminal, and coordination constraints.
+
+## Goals
+
+- Manage many terminal-native agents from one local profile.
+- Keep sessions running independently of the CLI, terminal UI, or HTTP server.
+- Provide complete CLI and terminal UI workflows, with an optional local browser
+  dashboard.
+- Preserve enough structured state to render status, activity, worktree context,
+  cost, watcher, conductor, and materialization information without scraping the
+  screen for everything.
+- Keep business logic centralized in the controller.
+- Keep runtime-specific behavior behind a small interface.
+- Treat project hooks, watcher config, sandbox paths, and materialization as
+  trust-gated operations.
 
 ## Non-Goals
 
-- No cloud control plane as a required dependency.
-- No hosted account system for first release.
-- No mandatory programming language, UI framework, database engine, or frontend toolkit.
-- No source compatibility promise with either source project.
-- No copied source code from `agent-deck` or `agent-of-empires`.
-- No implementation scaffold until the architecture is accepted.
+- No cloud control plane.
+- No hosted account or sync service.
+- No mandatory browser UI for core operation.
+- No terminal UI implementation details in public contracts.
+- No source compatibility promise with earlier prototypes.
 
-## Source Synthesis
+## Runtime Requirements
 
-Agent Helm keeps these `agent-deck` product behaviors:
+Agent Helm assumes these programs and environment capabilities for the full
+feature set:
 
-- Fleet dashboard: one place to see running, waiting, idle, stopped, errored, and archived sessions.
-- Groups: nested or named grouping, default paths, moving sessions between groups, and group-scoped navigation.
-- Search: fuzzy session search plus transcript or conversation search when indexed data exists.
-- Forking: quick fork and explicit fork flows, with parent linkage and optional worktree or state carryover.
-- MCP management: define servers once, attach or detach per session or profile, and restart affected sessions when needed.
-- Skills management: managed skill pool, project-level attachment, and deterministic materialization into agent-specific locations.
-- Conductor and watchers: supervised coordination sessions plus external event adapters that can wake or route work.
-- Cost tracking: append cost events, show current spend by session, group, project, model, and time window.
-- Web UI: browser terminal access, read-only mode, token-protected local server, archived sessions, costs, and fork actions.
-- Multi-agent support: Claude-like, Codex-like, Gemini-like, OpenCode-like, shell, and custom command agents through adapters.
-- Worktree ergonomics: create, finish, cleanup, setup hooks, ignored-file include rules, and bare-repo awareness.
-- Sandbox ergonomics: optional container-backed sessions, shared auth volumes, container shell, and one-shot sandboxed runs.
+- `tmux`: required for real session runtime, attach, send, capture, and TUI
+  embedded session view.
+- `git`: required for project detection, worktree creation, worktree cleanup,
+  diffs, repo identity, and carry-state behavior.
+- A POSIX-like shell: real session launch specs run through `sh -lc`.
+- A writable home directory: defaults use `~/.local/share/agent-helm` and
+  `~/.config/agent-helm`.
 
-Agent Helm keeps these `agent-of-empires` maintainability patterns:
+The code also has a fake runtime for tests. The fake runtime implements the same
+runtime trait, but it does not exercise tmux behavior.
 
-- Clear module boundaries around session storage, runtime, projects, workspaces, settings, TUI, web, and agent adapters.
-- Structured view model for agent protocol events, so web and TUI can render tool calls without scraping terminal text.
-- Web daemon that talks to the same controller as the CLI and TUI instead of owning separate business logic.
-- Explicit storage locking and atomic update rules for cross-process safety.
-- Project registry as a first-class data model with repo identity, default branch, trust state, and workspace roots.
-- Worktree manager separated from session lifecycle so branch and filesystem rules are reusable.
-- Sandboxing model separated from agent launch so trust and path restrictions can be tested independently.
-- Diff view as a first-class surface for reviewing changes from TUI and web.
-- Theme discipline: semantic color tokens shared across surfaces, density appropriate to a developer dashboard, and no decorative UI drift.
-- Settings schema and profile merge rules that make global, profile, project, and session overrides explicit.
+## Source Layout
 
-## Core Architecture
+- `src/main.rs`: CLI parsing, command dispatch, TUI bootstrap, optional HTTP
+  server bootstrap.
+- `src/controller.rs`: application service layer. It owns lifecycle validation,
+  orchestration across store/runtime/workspaces/adapters, read-only checks, and
+  high-level domain operations.
+- `src/store.rs`: SQLite persistence, migrations, profile locking, redaction at
+  event write time, and query helpers.
+- `src/runtime.rs`: runtime interface, tmux runtime, fake runtime, tmux attach
+  quirks, tmux capture/send/status/stop behavior.
+- `src/adapter.rs`: agent registry, launch specs, status derivation, fork plans,
+  structured event normalization, MCP and skill capability checks.
+- `src/workspace.rs`: project resolution, git repo identity, default branch
+  detection, git worktree creation/removal, carry-state copying, setup/teardown
+  hooks, sandbox path validation.
+- `src/tui.rs`: terminal dashboard, forms, grouped list, live preview, embedded
+  focused session, profile tool settings, keyboard/mouse handling.
+- `src/api.rs`: local HTTP API and browser dashboard routes, auth, read-only
+  mutation guard, stream endpoints.
+- `src/config.rs`: config loading, profile defaults, tool profiles, settings
+  file writes, path expansion.
+- `src/materialization.rs`: stable JSON view of effective MCP and skill
+  attachments.
+- `src/security.rs`: trust gates, sandbox path checks, event/JSON secret
+  redaction.
+- `src/models.rs`: shared DTOs and persisted records.
 
-All user surfaces call one application controller. No surface mutates storage or tmux directly.
+## Core Dependency Direction
 
-```text
-CLI / TUI / Web / HTTP API
-        |
-        v
-ApplicationController
-        |
-        +-- SessionStore
-        +-- SessionRuntime
-        +-- AgentAdapter registry
-        +-- WorkspaceManager
-        +-- ProjectRegistry
-        +-- MCP and Skills layer
-        +-- Orchestrator and Watchers
-        +-- NotificationRouter
-        +-- CostTelemetry
-```
-
-### Surfaces
-
-- CLI: scriptable commands for every lifecycle operation.
-- TUI: fast fleet dashboard, grouped navigation, search, structured session preview, diff view, and settings.
-- Web: local browser dashboard with terminal stream, structured view, diff view, project/worktree metadata, and read-only mode.
-- HTTP API: stable local automation surface used by web and external tools.
-
-### Application Controller
-
-The controller owns validation, permission checks, lifecycle orchestration, and event fan-out. It exposes command-shaped methods such as `create_session`, `send_input`, `fork_session`, `stop_session`, `archive_session`, and `attach_structured_view`.
-
-### Session Store
-
-The store owns durable profile state, session metadata, group metadata, event logs, cost events, project registry data, and conductor state. It must provide atomic row or record updates and must not rewrite full state for one session change unless the selected storage backend makes that transaction cheap and safe.
-
-### Session Runtime
-
-The runtime starts and controls terminal processes. The default runtime is tmux-backed so sessions survive UI exits, SSH disconnects, and web daemon restarts. Runtime implementations are replaceable behind the `SessionRuntime` interface.
-
-### Agent Adapters
-
-Adapters hide agent-specific launch, resume, status, fork, MCP, skill, and structured-protocol behavior. Terminal-only agents still work through runtime output and process status; richer agents can emit structured events.
-
-### Workspace And Worktree Manager
-
-The workspace manager owns project resolution, worktree creation, ignored-file inclusion, setup and teardown hooks, branch naming, cleanup, and multi-repo workspace metadata. Session creation asks this layer for a launch directory instead of building paths itself.
-
-### MCP And Skills Layer
-
-MCP and skills are profile, project, and session-scoped configuration layers. The controller resolves desired state, writes project/session state, and asks the relevant agent adapter how to materialize it.
-
-### Orchestration, Watchers, And Notifications
-
-The orchestrator coordinates conductor sessions, worker sessions, watcher events, reminders, escalations, and routing rules. Watchers are adapters for external event sources. Notifications are an output layer, not business logic.
-
-### Costs And Telemetry
-
-Cost telemetry records append-only events with enough fields to recompute pricing later. Local operational telemetry is opt-in and must never include secrets, transcripts, or source code unless explicitly exported by the user.
-
-## Interfaces
-
-Pseudo-interfaces are implementation-neutral. Names describe contracts, not required syntax.
+Every surface calls the controller. No surface should write the store directly or
+run tmux directly except for the TUI preview/embedded rendering path, which uses
+tmux only for read-only preview capture and embedded attach plumbing.
 
 ```text
-interface SessionStore
-  load_profile(profile_id) -> ProfileSnapshot
-  list_sessions(filter) -> SessionSummary[]
-  get_session(session_id) -> SessionRecord
-  create_session(record, initial_events) -> SessionRecord
-  update_session(session_id, expected_version, patch) -> SessionRecord
-  append_session_event(session_id, event) -> EventId
-  append_cost_event(session_id, cost_event) -> EventId
-  archive_session(session_id, archived_by, reason) -> SessionRecord
-  delete_session(session_id, mode) -> DeletionResult
-  with_profile_lock(profile_id, operation) -> Result
+CLI / terminal UI / HTTP API / browser UI
+    -> ApplicationController
+        -> SessionStore
+        -> SessionRuntime
+        -> AgentRegistry
+        -> WorkspaceManager
+        -> security/materialization helpers
 ```
+
+The controller is the boundary where write permissions, read-only mode, project
+trust, runtime status reconciliation, and event appends are enforced.
+
+## Configuration
+
+Configuration is loaded by profile. The default profile is `default`.
+
+Load order:
+
+1. Built-in defaults.
+2. `~/.config/agent-helm/config.toml`.
+3. `<profile data dir>/config.toml`.
+4. `~/.config/agent-helm/settings.toml`.
+
+The later file wins for overlapping settings. The terminal UI profile tool
+settings popup writes `settings.toml`.
+
+Built-in defaults:
+
+```toml
+profile = "default"
+data_dir = "~/.local/share/agent-helm/default"
+default_agent = "shell"
+default_group = "default"
+web_listen = "127.0.0.1:8420"
+web_read_only = false
+web_token_env = "AGENT_HELM_WEB_TOKEN"
+headroom_proxy_savings_path = "~/.headroom/proxy_savings.json"
+sandbox_image = "alpine:latest"
+sandbox_allowed_paths = []
+```
+
+Tool profiles define how agents are launched:
+
+```toml
+[tools.claude]
+installed = true
+executable = "claude"
+flags = []
+worktree = "always" # always, manual, never
+
+[tools.shell]
+installed = true
+worktree = "never"
+```
+
+If a session request supplies `--cmd`, that command wins. Otherwise the
+controller asks config for the tool command for the selected agent. Unknown tools
+can still be command-backed when the command is explicit.
+
+## Persistent State
+
+Each profile has an independent database:
 
 ```text
-interface SessionRuntime
-  start(session_id, launch_spec) -> RuntimeHandle
-  attach(session_id, attach_options) -> AttachResult
-  send(session_id, bytes_or_text) -> SendResult
-  capture(session_id, cursor, limit) -> OutputPage
-  status(session_id) -> RuntimeStatus
-  stop(session_id, signal_policy) -> StopResult
-  restart(session_id, launch_spec) -> RuntimeHandle
-  destroy(session_id) -> DestroyResult
+<data_dir>/state.db
+<data_dir>/state.db.lock
 ```
+
+The store uses SQLite in WAL mode with foreign keys enabled. Writes acquire an
+exclusive file lock on `state.db.lock`; this is separate from SQLite's own
+locking and gives the application a profile-level mutation guard. Long-running
+runtime work should not happen while holding store locks.
+
+Primary tables:
+
+- `sessions`: metadata and lifecycle state for every session.
+- `groups`: hierarchical group names, collapsed state, default project paths.
+- `session_events`: append-only events for status, input, agent state, sync,
+  structured payloads, fork/archive/delete context.
+- `cost_events`: append-only cost records tied to sessions.
+- `projects`: resolved repository roots, repo identity, default branch, trust
+  state, config/hook hashes.
+- `workspaces`: launch directories and links to worktrees/sandboxes.
+- `worktrees`: git worktree records and cleanup status.
+- `mcp_attachments`: profile/project/session MCP attachments.
+- `skill_attachments`: profile/project/session skill attachments.
+- `watchers`: watcher configs and lifecycle state.
+- `watcher_events`: normalized watcher events.
+- `conductors`: conductor sessions and heartbeat state.
+- `conductor_assignments`: work assigned to sessions by conductors.
+
+Records carry a `version` field. Update paths use the current version where
+conflict detection matters. IDs are UUID-like lowercase hex strings unless the
+record is append-only and uses an integer row id.
+
+## Session Model
+
+`SessionRecord` is the central record:
+
+- `id`, `name`, `profile`, `group_name`
+- `project_id`, `workspace_id`, `worktree_id`
+- `parent_session_id`
+- `agent`, `command`, `project_path`
+- `status`: lifecycle status (`starting`, `running`, `stopped`, `errored`)
+- `runtime_id`: tmux runtime handle when running
+- `archived`
+- `version`, `created_at`, `updated_at`
+
+There are two status layers:
+
+- Lifecycle status: what the runtime says about the process.
+- Deck status: user-facing activity status derived from lifecycle, recent
+  events, and open conductor assignments.
+
+Deck statuses are:
 
 ```text
-interface AgentAdapter
-  id -> AgentId
-  capabilities() -> AgentCapabilities
-  build_launch_spec(session_record, resolved_config) -> LaunchSpec
-  detect_status(runtime_snapshot, recent_events) -> AgentStatus
-  resume(session_record) -> LaunchSpec
-  fork(parent_session, fork_request) -> ForkPlan
-  apply_mcp(session_record, resolved_mcp) -> MaterializationPlan
-  apply_skills(session_record, resolved_skills) -> MaterializationPlan
-  parse_structured_event(raw_event) -> StructuredEvent?
+starting, running, queued, waiting, idle, stopped, errored
 ```
 
-```text
-interface WorkspaceManager
-  resolve_project(path) -> ProjectRef
-  register_project(project_spec) -> ProjectRecord
-  create_workspace(project_ref, workspace_request) -> WorkspaceRecord
-  create_worktree(project_ref, worktree_request) -> WorktreeRecord
-  finish_worktree(worktree_id, finish_policy) -> FinishResult
-  cleanup_orphans(project_ref) -> CleanupReport
-  validate_sandbox_paths(project_ref, sandbox_spec) -> ValidationResult
-```
+Deck status derivation prefers recent agent/activity events over raw runtime
+state. For example, a running tmux process can be shown as `waiting` after user
+input is sent, or `queued` when a conductor assignment is queued.
 
-```text
-interface WatcherAdapter
-  id -> WatcherId
-  validate(config) -> ValidationResult
-  start(config, event_sink) -> WatcherHandle
-  stop(handle) -> StopResult
-  normalize(raw_event) -> WatcherEvent
-```
+## Controller Responsibilities
 
-```text
-interface Orchestrator
-  route_event(watcher_event) -> RouteDecision
-  assign(conductor_id, session_id, task) -> Assignment
-  heartbeat(conductor_id) -> ConductorHealth
-  summarize_fleet(filter) -> FleetSummary
-  escalate(event, target) -> NotificationRequest
-```
+The controller owns all application semantics:
 
-## Lifecycle Flows
+- Initialize profile state.
+- Create sessions and optionally start them.
+- Resolve projects/workspaces/worktrees.
+- Build launch specs through the agent registry.
+- Wrap launches with agent-state hooks when supported.
+- Start, stop, restart, destroy, and status-check runtime sessions.
+- Reconcile runtime state back into the store.
+- Append lifecycle, input, fork, archive, delete, and agent-state events.
+- List and mutate groups.
+- Register, trust, untrust, and remove projects.
+- Create, finish, and cleanup worktrees.
+- Attach/detach/sync MCP and skill materialization.
+- Create, test, start, poll, stop, and delete watchers.
+- Create/start/heartbeat/stop/delete conductors and assignments.
+- Record and summarize costs.
+- Enforce read-only mode for all mutations.
 
-### Create Session
+Surfaces should not duplicate these rules. If a new command or route mutates
+state, add a controller method or reuse an existing one.
 
-1. Surface submits name, profile, project path, group, agent, sandbox, worktree, MCP, skills, and optional initial prompt.
-2. Controller resolves profile config, project config, repo trust state, and session defaults.
-3. Workspace manager resolves or creates project/workspace/worktree.
-4. Controller asks agent adapter for launch spec and materialization plans.
-5. Session store creates the session record and initial events under profile lock.
-6. Runtime starts the tmux-backed process.
-7. Controller records runtime handle, emits status update, and sends initial prompt if present.
+## Session Lifecycle
 
-### Start Or Restart Session
+### Create
 
-1. Controller loads session and verifies it is startable.
-2. Agent adapter builds launch or resume spec.
-3. Runtime starts process in the stored workspace.
-4. Store records runtime metadata and status event.
+1. Surface submits path, agent, command, name, group, worktree, sandbox, prompt,
+   and parent session if any.
+2. Controller enforces writable mode and initializes the store.
+3. Agent and group default from config when omitted.
+4. Controller resolves the project from the path, unless inheriting a parent
+   worktree.
+5. Worktree behavior is selected:
+   - Explicit `--worktree` creates a named branch worktree.
+   - Tool profile `worktree = "always"` auto-creates a worktree.
+   - Inherited worktree reuse happens for some fork paths.
+   - Otherwise the project root is used.
+6. Trusted projects may run setup hooks for created worktrees.
+7. Sandbox requests validate the launch path against configured allowed paths.
+8. Store creates project/workspace/worktree/session records.
+9. If `start_immediately` is false, store records a stopped status event.
+10. If starting, controller builds a launch spec, starts the runtime, records the
+    runtime handle, and appends runtime/agent-state events.
+11. If an initial prompt exists, controller sends it to the runtime and appends a
+    redacted input event.
 
-### Attach Session
+### Status
 
-1. Surface requests terminal attach.
-2. Controller verifies read/write permission for the surface.
-3. Runtime attaches to the tmux session or returns web terminal stream metadata.
-4. Structured-event consumers may attach in parallel without owning terminal input.
+1. Controller loads the session.
+2. If the runtime handle says the process stopped, controller clears the runtime
+   handle and stores `stopped` unless the controller is read-only.
+3. Running state appends runtime status/agent-state events when useful.
+4. `status_snapshot` derives deck status from recent events and conductor
+   assignments.
+
+Read-only controllers may return a reconciled in-memory status but must not write
+that reconciliation to the database.
+
+### Output
+
+For running sessions, controller calls runtime capture. For stopped sessions,
+output currently returns an error because the real source is the live tmux pane.
+The terminal UI deliberately skips output loading for running/starting sessions;
+the live preview path owns terminal output.
 
 ### Send Input
 
-1. Surface sends text, bytes, or command payload.
-2. Controller rejects writes in read-only mode or to non-running sessions.
-3. Runtime writes to the session pane or protocol channel.
-4. Store appends a user-input event without storing secrets marked as redacted.
+1. Controller verifies writable mode and running status.
+2. Runtime sends text to tmux with Enter.
+3. Store appends an `input` event with a redacted preview.
+4. Store appends an agent-state event indicating waiting.
 
-### Status Update
+### Stop and Restart
 
-1. Runtime status, hook events, protocol events, or bounded polling provide new state.
-2. Agent adapter maps raw runtime state to agent-aware status.
-3. Store updates only changed session fields and appends status event when status changes.
-4. Controller fans out updates to TUI, web, notifications, conductor, and cost telemetry.
+- Stop kills the tmux session, clears `runtime_id`, sets lifecycle status to
+  `stopped`, and appends a status event.
+- Restart refuses archived sessions, rebuilds the launch spec, restarts tmux,
+  records the new runtime handle, and appends status/agent-state events.
 
-### Fork Session
+### Archive and Restore
 
-1. Surface submits parent session and fork options.
-2. Controller loads parent, agent capabilities, project/workspace data, and fork defaults.
-3. Agent adapter produces a fork plan for conversation inheritance.
-4. Workspace manager optionally creates branch/worktree and copies allowed uncommitted or ignored state.
-5. Store creates child session with parent linkage.
-6. Runtime starts child session from fork plan.
+- Archive can stop a running session first, marks the session archived, and
+  appends archive metadata.
+- Restore clears the archived flag.
+- Default list views hide archived sessions unless requested.
 
-### Stop Session
+### Delete
 
-1. Controller verifies session is running or starting.
-2. Runtime sends graceful stop, then escalates according to signal policy.
-3. Store records stopped state, runtime exit metadata, and event.
-4. Notifications and orchestrator receive final state.
+Delete modes:
 
-### Resume Session
+- Metadata removal.
+- Purge session state.
+- Cleanup associated worktree when requested and allowed.
 
-1. Controller loads stopped or archived session.
-2. Agent adapter validates resume capability and conversation handle.
-3. Workspace manager verifies workspace still exists or offers repair.
-4. Runtime starts resume launch spec.
-5. Store records runtime handle and status.
+If cleanup is requested, the controller coordinates runtime destruction,
+worktree teardown, and store removal. Worktrees still attached to other sessions
+cannot be finished.
 
-### Delete Session
+### Fork
 
-1. Controller checks delete mode: metadata-only, with worktree cleanup, or full purge.
-2. Runtime is stopped if needed.
-3. Workspace manager runs teardown hooks and cleanup where allowed.
-4. Store tombstones or deletes session metadata according to retention policy.
-5. Append-only history remains unless full purge is explicitly requested.
+1. Controller loads the parent.
+2. Agent registry produces a fork plan.
+3. If `carry_state` is true, the child command can inherit the parent command and
+   conversation semantics for supported agents.
+4. Child session is created with parent linkage.
+5. Child may start immediately or remain stopped.
+6. Store appends a `forked` event.
 
-### Archive Session
+## Runtime: tmux
 
-1. Controller stops runtime if still running unless policy allows live archive.
-2. Store marks session archived, preserving transcript references, cost events, parent linkage, and workspace metadata.
-3. Default list views hide archived sessions; archive views can restore or delete them.
-
-### Web Structured-View Attach
-
-1. Web requests structured view for a session.
-2. Controller verifies auth token and read/write mode.
-3. Agent adapter exposes structured protocol stream when available.
-4. Web receives normalized tool calls, prompts, approvals, file edits, diffs, and status events.
-5. If no structured stream exists, web falls back to terminal output plus captured metadata.
-
-## Public Interfaces
-
-### CLI Shape
-
-Top-level command:
+The real runtime is tmux. Session names are derived from the Agent Helm session
+id and prefixed:
 
 ```text
+agent-helm-<safe-session-fragment>
+```
+
+Launch behavior:
+
+- `tmux new-session -d -s <name> -c <cwd> sh -lc <launch-command>`
+- Session options disable tmux status and prefix keys.
+- Window options disable pane border status.
+- Runtime handle id is the tmux session name.
+
+Attach behavior:
+
+- CLI attach installs a temporary root binding for `C-q` to detach the tmux
+  client.
+- The previous `C-q` root binding is restored after attach exits.
+
+Send behavior:
+
+- Text is sent with `tmux send-keys -t <name> <text> Enter`.
+
+Capture behavior:
+
+- Output capture uses `tmux capture-pane -p -S -<limit>`.
+- ANSI-preserving capture adds `-e`.
+- Captured output trims only the final capture newline for line accounting.
+
+Status behavior:
+
+- Runtime status uses `tmux has-session`.
+- Missing tmux session maps to `stopped`.
+
+Destroy behavior:
+
+- Stop and destroy kill the tmux session.
+
+## Agent Registry
+
+The agent registry defines known adapters:
+
+- `shell`
+- `claude`
+- `codex`
+- `gemini`
+- `opencode`
+- `custom`
+
+Capabilities include:
+
+- command-backed launch
+- resume
+- fork
+- MCP
+- skills
+- structured events
+- agent-state hooks
+
+AI-like agents support MCP, skills, structured events, and agent-state hooks.
+Command-only agents do not support MCP/skills, but they still produce normalized
+structured events from recorded session events.
+
+Launch specs:
+
+- Session command is shell-quoted and run in the selected working directory.
+- Sandbox launches wrap the command in a container command when requested.
+- Agent-state hooks wrap supported agent launches so the binary can record
+  activity transitions back into Agent Helm.
+
+Status derivation:
+
+- Lifecycle `starting`, `stopped`, and `errored` map directly.
+- Running sessions inspect recent events.
+- Recent active tool events map to `running`.
+- Recent input events map to `waiting`.
+- Done/idle agent events map to `idle`.
+- Open conductor assignments can map to `queued` or `waiting`.
+
+The registry also normalizes structured events from stored session events so the
+web surface can render tool calls and state without owning agent-specific logic.
+
+## Projects, Workspaces, and Worktrees
+
+Project resolution:
+
+- If the path is inside a git repo, the project root is `git rev-parse
+  --show-toplevel`.
+- Otherwise the existing path is the project root.
+- Repo identity prefers origin URL with credentials stripped.
+- Default branch prefers `origin/HEAD`, then `main`, then `master`, then current
+  branch or git default branch config.
+
+Project trust:
+
+- New projects are untrusted unless explicitly registered/trusted.
+- Trusted projects may run setup/teardown hooks and project-scoped privileged
+  behavior.
+- Trust is required for hooks, MCP, skills, and watchers.
+
+Workspaces:
+
+- A workspace is the path a session launches in.
+- It can point at the project root, a git worktree, or a sandbox path.
+- It records cleanup policy and multi-root metadata as strings.
+
+Worktrees:
+
+- Named worktrees are created with git worktree.
+- Branch names are generated from requested branch/session context.
+- Carry-state copies tracked diffs, untracked files, and ignored files from the
+  source worktree into the target worktree.
+- Setup hooks run only after a trusted project creates a worktree.
+- Teardown hooks run only for trusted projects.
+- Cleanup refuses worktrees still attached to sessions.
+
+Sandboxing:
+
+- Sandbox paths must exist and be under configured allowed paths.
+- Validation happens before launch and before using created worktree paths.
+- The default image is configured but sandbox execution remains launch-spec
+  wrapping, not a separate runtime.
+
+## Terminal UI
+
+The terminal UI is a stateful local client over the controller. It renders:
+
+- grouped session list
+- status/activity counts
+- live preview for running sessions
+- detail/output panel for non-live sessions
+- embedded focused session
+- create/fork/move/send/settings/help forms
+
+Startup:
+
+1. `main.rs` loads all sessions including archived sessions.
+2. It loads groups.
+3. It passes closures to the UI for status loading, detail loading, and actions.
+4. UI state owns selection, collapsed groups, filters, scroll, sidebar width,
+   preview cache, embedded session state, and modal forms.
+
+Navigation:
+
+- `j/k` and arrow keys change selection.
+- `/` enters search.
+- `a` toggles archived visibility.
+- `t` cycles status filter.
+- `c/e` collapse or expand groups.
+- `Enter` focuses the selected running session.
+- `Ctrl-q` returns from focused session to the dashboard.
+
+Sidebar sizing:
+
+- Default sidebar width is 24 percent.
+- The divider can be dragged.
+- Minimum is 18 percent; maximum is 50 percent.
+- Focusing a session preserves the current width. Preview and focused session
+  use the same split, so entering a session should not shift the panel widths.
+
+Live preview:
+
+- The dashboard preview is read-only and uses `tmux capture-pane`.
+- Preview capture is off the UI thread.
+- Preview capture first syncs the tmux window to the preview viewport size. This
+  keeps initial dashboard preview and focused-session attach from disagreeing
+  about the top visible row.
+- The preview worker is latest-only: when rapid navigation enqueues many
+  requests, stale queued requests are skipped.
+- Requests carry a generation id, session id, target, dimensions, and scroll.
+- Results are applied only when they still match the pending request.
+- Stale results are ignored.
+- Preview refresh interval is 500 ms.
+- Selection/detail movement must not wait for capture-pane.
+
+Preview capture quirks:
+
+- Alternate-screen capture is attempted first with tmux flags for alternate
+  content.
+- If alternate-screen capture is empty, visible pane capture is used.
+- Visible capture uses `-S -<rows>` plus ANSI escapes.
+- Final capture newline is trimmed before terminal parsing. Without this, the
+  parser creates one extra bottom row and the first visible row disappears.
+- Lone `\n` bytes are normalized to `\r\n` before parsing so lines return to
+  column zero.
+- Rendering bottom-crops the parsed screen to the preview area and supports
+  mouse wheel scrollback.
+
+Details loading:
+
+- Details are debounced after selection changes by 125 ms.
+- Running/starting sessions do not load controller output on selection change;
+  preview owns terminal output.
+- Stopped/errored sessions can load non-live details after the debounce.
+- If details do not belong to the selected session yet, the detail panel renders
+  a loading state rather than stale output.
+
+Embedded focused session:
+
+- The focused view attaches tmux through a PTY and feeds bytes into a terminal
+  screen parser.
+- Input keys are encoded and written to the PTY.
+- Resize updates both the parser and PTY size.
+- The command uses `TERM=xterm-256color`.
+- The TUI renders terminal cells itself and sets the outer terminal cursor when
+  the inner app leaves the cursor visible.
+- Some full-screen apps hide the cursor. In focused session mode, Agent Helm
+  paints an inverted cursor overlay at the parsed cursor position so text input
+  location remains visible.
+- Focused attach is not used for dashboard preview; preview remains read-only
+  capture-pane snapshots.
+
+## CLI Surface
+
+The top-level shape:
+
+```bash
 agent-helm [--profile <name>] [--json] <command>
 ```
 
-Lifecycle commands:
+No command opens the terminal UI.
 
-```text
-agent-helm add <path> [--agent <id>] [--group <name>] [--name <name>] [--worktree <branch>] [--sandbox] [--prompt <text>]
+Common session commands:
+
+```bash
+agent-helm init
+agent-helm add <path> [--agent <id>] [--cmd <cmd>] [--name <name>] [--group <name>] [--worktree <branch>] [--carry-state] [--sandbox] [--prompt <text>]
 agent-helm list [--all] [--archived] [--group <name>] [--status <status>]
-agent-helm attach <session>
-agent-helm send <session> <text>
-agent-helm stop <session>
-agent-helm restart <session>
-agent-helm remove <session> [--purge] [--cleanup-worktree]
-agent-helm fork <session> [--name <name>] [--group <name>] [--worktree <branch>] [--carry-state]
-agent-helm serve [--listen <addr>] [--token <token>] [--read-only]
+agent-helm search <query> [--limit <n>]
+agent-helm session start|stop|restart <session>
+agent-helm session create <path> ...
+agent-helm session remove <session> [--purge] [--cleanup-worktree]
+agent-helm session archive <session> [--by <actor>] [--reason <text>]
+agent-helm session restore <session>
+agent-helm session fork <session> [--name <name>] [--group <name>] [--worktree <branch>] [--carry-state] [--no-start]
+agent-helm session attach <session>
+agent-helm session show <session>
+agent-helm session status <session>
+agent-helm session status-snapshot <session>
+agent-helm session send <session> <text>
+agent-helm session output <session> [--limit <n>] [--ansi]
+agent-helm session events <session> [--since <ts>]
+agent-helm session record-event <session> <kind> <payload-json>
+agent-helm session sync-state <session>
+agent-helm session diff <session>
+agent-helm session materialization <session>
+agent-helm session structured-events <session>
 ```
 
-Domain commands:
+Other command families:
 
-```text
+```bash
+agent-helm group list|create|update|delete|move
 agent-helm project add|list|show|trust|untrust|remove
-agent-helm worktree create|finish|cleanup|list
-agent-helm mcp list|attach|detach|sync
-agent-helm skill list|attach|detach|sync
-agent-helm watcher list|start|stop|test
-agent-helm conductor setup|list|start|stop|send|status
+agent-helm workspace show|list
+agent-helm worktree create|show|finish|cleanup|list
+agent-helm mcp list|attach|attach-project|attach-profile|detach|sync
+agent-helm skill list|attach|attach-project|attach-profile|detach|sync
+agent-helm watcher list|events|create|start|poll|ingest|poll-all|test|stop|remove
+agent-helm conductor setup|list|start|heartbeat|stop|remove|send|complete|fail|cancel|assignments|status
+agent-helm costs [events|record] [filters]
+agent-helm tui
+agent-helm serve [--listen <addr>] [--token <token>] [--token-env <env>] [--read-only]
 ```
 
-### HTTP Shape
+Prefer adding new lifecycle behavior under existing command families before
+adding new top-level commands.
 
-The HTTP API is local-first and token-protected when the server is exposed beyond loopback.
+## HTTP API and Browser UI
+
+The optional HTTP server is a local API plus an embedded browser dashboard.
+
+Server behavior:
+
+- Default listen address is `127.0.0.1:8420`.
+- A token can be passed directly or read from an environment variable.
+- Non-loopback access should use a token.
+- Read-only mode rejects mutating methods before handlers run.
+- API errors are JSON envelopes with `code` and `message`.
+
+Main route families:
 
 ```text
-GET    /api/sessions
-POST   /api/sessions
-GET    /api/sessions/{id}
-POST   /api/sessions/{id}/send
-GET    /api/sessions/{id}/output
-POST   /api/sessions/{id}/fork
-POST   /api/sessions/{id}/stop
-POST   /api/sessions/{id}/restart
-DELETE /api/sessions/{id}
+GET  /
+GET  /s/:id
+GET  /api/about
 
-GET    /api/projects
-POST   /api/projects
-GET    /api/projects/{id}
-GET    /api/projects/{id}/worktrees
-POST   /api/projects/{id}/worktrees
+GET,POST     /api/sessions
+GET,DELETE   /api/sessions/:id
+GET          /api/search
+GET          /api/sessions/:id/status
+GET          /api/sessions/:id/status-snapshot
+POST         /api/sessions/:id/send
+GET          /api/sessions/:id/output
+POST         /api/sessions/:id/fork
+POST         /api/sessions/:id/archive
+POST         /api/sessions/:id/restore
+POST         /api/sessions/:id/start
+POST         /api/sessions/:id/stop
+POST         /api/sessions/:id/restart
+POST         /api/sessions/:id/group
+GET          /api/sessions/:id/diff
+GET          /api/sessions/:id/materialization
+GET,POST     /api/sessions/:id/events
+POST         /api/sessions/:id/sync-state
+GET          /api/sessions/:id/terminal-stream
+GET          /api/sessions/:id/structured-events
+GET          /api/sessions/:id/structured-stream
 
-GET    /api/sessions/{id}/structured-stream
-GET    /api/sessions/{id}/terminal-stream
-GET    /api/sessions/{id}/diff
+GET,POST     /api/groups
+PATCH,DELETE /api/groups/*name
 
-GET    /api/mcp
-POST   /api/sessions/{id}/mcp
-GET    /api/skills
-POST   /api/sessions/{id}/skills
+GET,POST     /api/projects
+GET,DELETE   /api/projects/:id
+POST         /api/projects/:id/trust
+POST         /api/projects/:id/untrust
+GET          /api/projects/:id/workspaces
+GET          /api/workspaces/:id
+GET,POST     /api/projects/:id/worktrees
+POST         /api/projects/:id/worktrees/cleanup
+GET          /api/worktrees/:id
+POST         /api/worktrees/:id/finish
 
-GET    /api/watchers
-POST   /api/watchers/{id}/start
-POST   /api/watchers/{id}/stop
-GET    /api/conductors
-POST   /api/conductors/{id}/send
-GET    /api/costs
+GET,POST     /api/mcp
+POST         /api/profile/mcp
+POST         /api/projects/:id/mcp
+POST         /api/sessions/:id/mcp
+POST         /api/mcp/sync
+POST         /api/mcp/:id/detach
+
+GET,POST     /api/skills
+POST         /api/profile/skills
+POST         /api/projects/:id/skills
+POST         /api/sessions/:id/skills
+POST         /api/skills/sync
+POST         /api/skills/:id/detach
+
+GET,POST     /api/watchers
+DELETE       /api/watchers/:id
+GET          /api/projects/:id/watchers
+GET,POST     /api/watchers/:id/events
+POST         /api/watchers/:id/test
+POST         /api/watchers/:id/start
+POST         /api/watchers/:id/poll
+POST         /api/watchers/:id/stop
+POST         /api/watchers/poll
+
+GET          /api/conductors
+POST         /api/sessions/:id/conductor
+GET,DELETE   /api/conductors/:id
+GET          /api/conductors/:id/assignments
+POST         /api/conductor-assignments/:id/complete
+PATCH        /api/conductor-assignments/:id
+POST         /api/conductors/:id/start
+POST         /api/conductors/:id/heartbeat
+POST         /api/conductors/:id/stop
+POST         /api/conductors/:id/send
+
+POST         /api/sessions/:id/costs
+GET          /api/costs
+GET          /api/cost-events
 ```
+
+The browser dashboard should remain a client of these routes. It should not
+define separate business rules.
+
+## MCP and Skills
+
+MCP and skill attachments exist at three scopes:
+
+- profile
+- project
+- session
+
+Attachments record:
+
+- scope and target ids
+- server or skill id
+- materialized path/state
+- attachment status
+- restart requirement
+
+Effective materialization for a session is the merge of attached profile,
+project, and session records. The materialization module produces stable JSON so
+the CLI, API, and tests can compare output deterministically.
+
+Project-scoped MCP/skill operations are trust-gated. Detaching marks records
+detached and usually makes restart required. Sync recomputes materialized state
+and clears restart flags for attached records.
+
+## Watchers
+
+Watchers are stored configs that can receive or poll external events. Current
+records track:
+
+- profile
+- optional project id
+- adapter id
+- config ref
+- status
+- backoff state
+- timestamps/version
+
+Watcher events store normalized source, event type, payload reference, signature
+status, route decision, delivery flag, and timestamp.
+
+Important constraints:
+
+- Project watchers are trust-gated.
+- Ingested payloads are references/strings, not arbitrary executable behavior.
+- Polling running watchers records events and updates watcher state.
+- Watcher routes should stay controller-owned so CLI/API behavior matches.
+
+## Conductors
+
+A conductor is a session that coordinates work for other sessions.
+
+Conductor records track:
+
+- conductor session id
+- lifecycle status
+- watched session list
+- channel bindings
+- last heartbeat
+- timestamps/version
+
+Assignments track:
+
+- conductor id
+- target session id
+- task ref
+- status
+- assigned/completed timestamps
+
+Assignments feed deck status derivation. For example, queued or assigned work can
+make an otherwise running session appear queued/waiting in the dashboard.
+
+## Costs
+
+Costs are append-only events tied to sessions. A cost event contains:
+
+- session id
+- amount in USD
+- JSON payload with model, source, token counts, etc.
+- timestamp
+
+Summary filters:
+
+- profile
+- project
+- group
+- session
+- agent
+- model
+- start/end time
+- include archived or active only
+
+Store summary converts dollar amounts into micros for stable integer totals.
+
+## Search, Diff, and Structured Events
+
+Search:
+
+- Searches session metadata.
+- Searches captured output where available.
+- Searches known transcript formats for supported agents when files can be
+  located.
+- Returns session id, name, group, agent, cwd, source, and snippet.
+
+Diff:
+
+- Diffs are generated from the session workspace path with git.
+- Diff generation is on demand.
+- The CLI/API return plain diff text wrapped as needed by the surface.
+
+Structured events:
+
+- Raw session events are normalized by the agent registry.
+- API exposes both snapshot and stream routes.
+- Structured rendering should prefer normalized events over terminal scraping.
+
+## Security and Safety
 
 Read-only mode:
 
-- Allows `GET` endpoints for sessions, output, structured streams, terminal streams, diffs, projects, worktrees, watchers, conductors, and costs.
-- Rejects `POST`, `PATCH`, `PUT`, and `DELETE` endpoints that mutate state or send input.
-- May allow local UI preferences that do not touch session, project, config, or runtime state.
+- Controller rejects writes.
+- HTTP API also rejects mutation methods through a request guard.
+- Runtime/status reconciliation must not write to the store in read-only mode.
 
-### Config Shape
+Project trust:
 
-Primary config file:
+- Hooks, project MCP, project skills, and watchers require trusted projects.
+- Trust state is explicit and stored per project.
 
-```toml
-[profiles.default]
-data_dir = "~/.local/share/agent-helm/default"
+Sandbox paths:
 
-[agents.claude]
-command = "claude"
+- Paths are canonicalized.
+- Requested sandbox paths must be under an allowed path.
+- Missing paths fail validation.
 
-[session_defaults]
-agent = "claude"
-group = "default"
-status_poll_interval_ms = 1000
+Redaction:
 
-[worktrees]
-enabled = true
-default_location = "sibling"
-default_base_branch = "main"
+- Event payloads are redacted before being stored when they contain common secret
+  keys or bearer tokens.
+- Cost/event exports should not bypass store redaction.
 
-[sandboxing]
-enabled_by_default = false
-allowed_paths = ["~/git"]
-volume_ignores = ["node_modules", ".venv", "target"]
+Web access:
 
-[web]
-listen = "127.0.0.1:8420"
-read_only = false
+- Default bind is loopback.
+- Token auth is available and should be used for exposed listeners.
+- Read/write mode should be obvious before exposing a server beyond loopback.
 
-[web.auth]
-token_env = "AGENT_HELM_WEB_TOKEN"
+## Testing and Verification
 
-[mcp]
-pool_enabled = false
+Standard checks:
 
-[skills]
-pool_dir = "~/.config/agent-helm/skills/pool"
-
-[watchers]
-enabled = true
-
-[conductor]
-enabled = true
-
-[costs]
-enabled = true
-retention_days = 90
-
-[theme]
-name = "default"
+```bash
+cargo fmt --check
+cargo test --all-features
+cargo clippy --all-targets --all-features
+AGENT_HELM_TMUX_SMOKE=1 cargo test --all-features terminal_preview_smoke_test
+./scripts/harness.sh
+git diff --check
 ```
 
-Config merge order:
+The harness uses temporary state and exercises CLI/API/runtime behavior. Tmux
+smoke tests are gated by environment variables so normal unit tests do not
+require a real tmux server.
 
-```text
-built-in defaults < global config < profile config < project config < session overrides < CLI/API request
-```
+Test layers:
 
-Repo config may define session, sandbox, worktree, hook, MCP, skill, and watcher defaults only after the project is trusted.
+- Store tests cover migrations, CRUD, locking-adjacent behavior, redaction,
+  costs, and queries.
+- Controller tests cover lifecycle, worktrees, trust gates, watchers,
+  conductors, search, and state sync.
+- Runtime tests cover fake runtime always and tmux runtime when smoke is enabled.
+- Terminal UI tests cover rendering, grouped navigation, preview behavior,
+  embedded session behavior, mouse resize/scroll, forms, and settings.
+- API tests cover route behavior, auth/read-only behavior, and response shape.
 
-## State Model
+## Reproduction Invariants
 
-- Profile: data directory, active settings, theme, default agent, feature flags, and auth references.
-- Session: id, title, profile, group, project, workspace, agent id, status, runtime handle, parent id, archived flag, timestamps, and version.
-- Group: id, name/path, ordering, default project path, collapsed state, and display metadata.
-- Project: id, root path, repo identity, default branch, trust state, hooks hash, and config hash.
-- Workspace: id, project id, path, worktree id, sandbox id, multi-repo roots, and cleanup policy.
-- Agent config: command, environment references, capabilities, resume/fork handles, and protocol mode.
-- MCP config: server definitions, scope, materialized state, conflicts, and restart requirements.
-- Skill config: pool entries, session attachments, project attachments, materialized paths, and sync status.
-- Watcher event: source, normalized type, payload reference, signature status, route decision, and delivery state.
-- Conductor state: conductor session id, watched sessions, assignments, heartbeats, escalations, and channel bindings.
-- Cost event: session id, agent id, model, token counts, price version, estimated cost, source, and timestamp.
+These are the details that are easy to miss when rebuilding Agent Helm:
 
-## Storage Contracts
-
-- Every profile has independent state and locks.
-- Mutations are atomic: either the full intended change is visible or no change is visible.
-- Cross-process writers use explicit profile locks.
-- Long-running runtime operations never hold storage locks.
-- Session updates use expected version or equivalent conflict detection.
-- Single-session changes update a single row or record plus append event; they do not rewrite unrelated session state.
-- History-bearing data uses append-only event logs: status changes, lifecycle events, watcher events, conductor actions, costs, and deletes.
-- Compaction is allowed only as a background maintenance operation with snapshot plus retained event cursor.
-- Storage files, if used, are written with temp-file, fsync, rename, and directory fsync semantics where the platform supports them.
-- Secrets are referenced by environment variable, keychain, local secret store, or untracked file path; tracked config never contains secret values.
-
-## Performance Rules
-
-- Do not rewrite full state for a single-row or single-session change.
-- Bound status polling by active sessions, visible sessions, and backoff state.
-- Prefer hook, protocol, and event paths over terminal pane scraping.
-- Use pane scraping only as a fallback for agents without richer status or protocol signals.
-- Index transcripts lazily and incrementally; startup must not scan every transcript.
-- Web terminal streams and structured streams use isolated workers or bounded tasks so one slow browser cannot block session control.
-- Startup path loads profile metadata, session summaries, and current runtime handles first; expensive indexes, costs, and transcripts load after first paint.
-- Diff generation is on demand and cached by repo state.
-- Cost recomputation is a background operation over append-only cost events.
-
-## Security Model
-
-- Local-first storage under user-owned config and data directories.
-- Web server binds to loopback by default.
-- Web token auth is required for non-loopback access and recommended for all browser access.
-- Read-only web mode blocks all writes, sends, restarts, deletes, forks, config changes, and project trust changes.
-- Repo trust gate is required before project hooks, project MCP config, project skill materialization, sandbox overrides, or watcher config can run.
-- Sandbox path restrictions are validated before launch and again before bind mounting.
-- Worktree setup and teardown hooks run only for trusted projects.
-- Webhook watcher adapters verify HMAC or equivalent signatures when the event source supports signing.
-- Watcher payloads are stored as events with redaction support.
-- Secrets never go into tracked config, logs, transcripts, cost events, or exported diagnostics unless explicitly included by the user.
-- Remote or tunneled access must surface address, auth mode, and read/write mode before enabling.
-
-## Testing Strategy
-
-- Store tests: locking, atomic writes, version conflicts, append-only events, profile isolation, and migration behavior.
-- Runtime tests: tmux session start, attach, send, capture, stop, restart, and orphan recovery through a fake runtime plus smoke tests for real tmux.
-- Agent adapter tests: capability flags, launch spec generation, status detection, resume, fork planning, MCP materialization, and structured event parsing.
-- Workspace tests: project resolution, bare repo handling, worktree creation, ignored-file inclusion, setup/teardown hooks, cleanup, and path validation.
-- Controller tests: create, start, attach, send, status update, fork, stop, resume, delete, archive, and read-only rejection.
-- Web/API tests: route permissions, token auth, structured stream, terminal stream, diff endpoint, fork endpoint, and read-only behavior.
-- TUI tests: grouped list rendering, search, status transitions, diff view entry, structured view entry, and theme token use.
-- Security tests: repo trust gate, sandbox restrictions, webhook signature checks, secret redaction, and no tracked secret config.
-- Performance tests: startup with many sessions, bounded polling, lazy transcript indexing, event fan-out under slow web clients, and single-session update cost.
-
-## Acceptance Criteria
-
-- README documents the current milestone and runnable checks.
-- CLI, TUI, optional HTTP API, config, storage, lifecycle, state, security, and
-  testing contracts stay covered by implementation or docs.
-- Broader architecture items remain explicit backlog until promoted into the
-  README milestone.
-- No source code is copied from `agent-deck` or `agent-of-empires`.
+- Sessions must outlive UI processes; tmux is the current mechanism.
+- All surfaces must go through the controller for writes.
+- The store must be per-profile and protected by an app-level lock file.
+- Runtime operations must not hold store locks.
+- Read-only mode must not persist status reconciliation.
+- Session status and deck status are different concepts.
+- Group names are path-like strings; collapsed parent groups hide descendants.
+- Project trust gates hooks, project materialization, and watchers.
+- Worktree cleanup must refuse worktrees attached to live session records.
+- Agent launch commands may be wrapped to emit agent-state events.
+- Running-session output in the dashboard should come from preview capture, not
+  synchronous controller output loading.
+- Terminal preview capture must run off the UI thread.
+- Preview requests/results must be generation checked and stale-safe.
+- Tmux capture output has a final newline; trim it before terminal parsing.
+- Normalize lone newlines before terminal parsing or text starts in the wrong
+  column.
+- Preview and focused session should use the same panel split.
+- Preview capture should size tmux to the preview viewport before reading; if
+  this only happens on focused attach, the initial preview can drop top rows.
+- Full-screen terminal apps can hide the cursor; focused embedded mode should
+  draw a cursor overlay.
+- The browser UI is optional and should remain a local API client.
+- Stable materialization JSON is required for MCP/skill reproducibility.
+- Cost records are append-only; summaries are derived.
