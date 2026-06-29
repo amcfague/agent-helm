@@ -8,8 +8,8 @@ use crate::{
 };
 use crossterm::{
     event::{
-        self, DisableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
-        MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+        MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{
@@ -559,6 +559,38 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
     Ok(())
 }
 
+fn sync_mouse_capture(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    enabled: &mut bool,
+    app: &App,
+) -> Result<()> {
+    let should_enable = wants_mouse_capture(app);
+    if should_enable == *enabled {
+        return Ok(());
+    }
+    let command_result = if should_enable {
+        execute!(terminal.backend_mut(), EnableMouseCapture)
+    } else {
+        execute!(terminal.backend_mut(), DisableMouseCapture)
+    };
+    command_result?;
+    *enabled = should_enable;
+    Ok(())
+}
+
+fn wants_mouse_capture(app: &App) -> bool {
+    app.mouse_capture && (matches!(app.mode, Mode::Session(_)) || mouse_preview_available(app))
+}
+
+fn mouse_preview_available(app: &App) -> bool {
+    if !matches!(app.mode, Mode::Normal | Mode::Search) {
+        return false;
+    }
+    app.view()
+        .selected
+        .is_some_and(|session| session_is_live(session.status))
+}
+
 struct App {
     sessions: Vec<SessionRecord>,
     collapsed_groups: BTreeSet<String>,
@@ -574,6 +606,7 @@ struct App {
     status_filter: StatusFilter,
     sidebar_percent: u16,
     resizing_sidebar: bool,
+    mouse_capture: bool,
     animation_frame: usize,
     last_agent: String,
     headroom_metrics: Option<HeadroomMetrics>,
@@ -614,6 +647,7 @@ fn app_from_initial(initial: TuiInitialState) -> App {
         status_filter: StatusFilter::All,
         sidebar_percent: DEFAULT_SIDEBAR_PERCENT,
         resizing_sidebar: false,
+        mouse_capture: true,
         animation_frame: 0,
         last_agent: default_agent,
         headroom_metrics: initial.headroom_metrics,
@@ -2146,8 +2180,10 @@ where
     refresh_details(app, load_details, true)?;
     let preview_worker = PreviewWorker::spawn();
     let mut tui_loop = TuiLoop::new(Instant::now());
+    let mut mouse_capture_enabled = false;
     loop {
         let now = Instant::now();
+        sync_mouse_capture(terminal, &mut mouse_capture_enabled, app)?;
         if tui_loop.should_refresh_sessions(now) {
             refresh_sessions(app, handle_action)?;
             refresh_deck_statuses(app, load_deck_statuses)?;
@@ -2439,6 +2475,11 @@ fn process_key<F>(
 where
     F: FnMut(TuiAction) -> Result<Vec<SessionRecord>>,
 {
+    if matches!(app.mode, Mode::Normal | Mode::Search) && is_plain_ctrl_key(key, 't') {
+        toggle_mouse_capture(app);
+        return Ok(false);
+    }
+
     match app.mode {
         Mode::Normal if key.code == KeyCode::Enter => {
             focus_selected_session(app);
@@ -2462,6 +2503,15 @@ where
 
 fn is_plain_ctrl_key(key: KeyEvent, ch: char) -> bool {
     key.code == KeyCode::Char(ch) && key.modifiers == KeyModifiers::CONTROL
+}
+
+fn toggle_mouse_capture(app: &mut App) {
+    app.mouse_capture = !app.mouse_capture;
+    app.status_message = Some(if app.mouse_capture {
+        "mouse wheel scrolling enabled".to_string()
+    } else {
+        "terminal text selection enabled".to_string()
+    });
 }
 
 fn is_global_quit_key(key: KeyEvent, mode: &Mode) -> bool {
@@ -2551,6 +2601,7 @@ fn scroll_session_preview(app: &mut App, delta: i16) -> bool {
 fn focus_selected_session(app: &mut App) {
     if selected_id(app).is_some() {
         app.detail_scroll = 0;
+        app.mouse_capture = false;
         app.mode = Mode::Session(SendForm::default());
         app.status_message = None;
     } else {
@@ -3235,6 +3286,10 @@ fn handle_session_key(key: KeyEvent, app: &mut App) -> Result<()> {
         app.status_message = Some("returned to dashboard".to_string());
         return Ok(());
     }
+    if is_plain_ctrl_key(key, 't') {
+        toggle_mouse_capture(app);
+        return Ok(());
+    }
 
     if let Some(embedded) = app.embedded.as_mut() {
         embedded.write_key(key)?;
@@ -3853,6 +3908,7 @@ fn help_panel() -> Paragraph<'static> {
         section_line("Navigation"),
         Line::from("j/k or Up/Down select session | c collapse | e expand"),
         Line::from("Enter focuses embedded session viewport | Ctrl-q returns"),
+        Line::from("Ctrl-t toggles mouse wheel scrolling and text selection"),
         Line::from(""),
         section_line("Actions"),
         Line::from("n new session | Ctrl-n shell | N duplicate | m move group"),
@@ -4573,7 +4629,7 @@ fn footer(app: &App) -> Paragraph<'static> {
 
 fn footer_text(app: &App) -> String {
     match &app.mode {
-        Mode::Search => "Search: type query | Enter/Esc done".to_string(),
+        Mode::Search => "Search: type query | Enter/Esc done | Ctrl-t mouse/select".to_string(),
         Mode::New(_) => {
             "New: Tab field | Enter next/create | Ctrl-S create | Esc cancel".to_string()
         }
@@ -4581,14 +4637,17 @@ fn footer_text(app: &App) -> String {
             "Create group: Tab field | Enter next/create | Ctrl-S create | Esc cancel".to_string()
         }
         Mode::Fork(_) => "Fork: Tab field | Enter next/fork | Ctrl-S fork | Esc cancel".to_string(),
-        Mode::Session(_) => "Session: interactive tmux viewport | Ctrl-q dashboard".to_string(),
+        Mode::Session(_) => {
+            "Session: interactive tmux viewport | Ctrl-q dashboard | Ctrl-t mouse/select"
+                .to_string()
+        }
         Mode::Move(_) => "Move: type group | Enter move | Esc cancel".to_string(),
         Mode::ToolSettings(_) => {
             "Profile tools: Tab field | Left/Right cycle | Space toggle | Ctrl-S save | Esc cancel".to_string()
         }
         Mode::Help => "Help: Esc/q close".to_string(),
         Mode::Normal => {
-            "Enter session m move r restart f fork d delete D cleanup | n new Ctrl-n shell N duplicate | g tools | j/k nav c/e groups Pg scroll / search t status ? help q quit".to_string()
+            "Enter session m move r restart f fork d delete D cleanup | n new Ctrl-n shell N duplicate | g tools | Ctrl-t mouse/select | j/k nav c/e groups Pg scroll / search t status ? help q quit".to_string()
         }
     }
 }
@@ -5202,6 +5261,7 @@ mod tests {
             status_filter: StatusFilter::All,
             sidebar_percent: DEFAULT_SIDEBAR_PERCENT,
             resizing_sidebar: false,
+            mouse_capture: true,
             animation_frame: 0,
             last_agent: "shell".to_string(),
             headroom_metrics: None,
@@ -5810,7 +5870,7 @@ mod tests {
 
         assert_eq!(
             footer_text(&app),
-            "Enter session m move r restart f fork d delete D cleanup | n new Ctrl-n shell N duplicate | g tools | j/k nav c/e groups Pg scroll / search t status ? help q quit"
+            "Enter session m move r restart f fork d delete D cleanup | n new Ctrl-n shell N duplicate | g tools | Ctrl-t mouse/select | j/k nav c/e groups Pg scroll / search t status ? help q quit"
         );
     }
 
@@ -6441,6 +6501,59 @@ mod tests {
 
         assert_eq!(app.mode, Mode::Normal);
         assert_eq!(app.status_message.as_deref(), Some("returned to dashboard"));
+    }
+
+    #[test]
+    fn session_mode_ctrl_t_toggles_mouse_capture() {
+        let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
+        app.mode = Mode::Session(SendForm::default());
+
+        handle_session_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .unwrap();
+
+        assert!(!app.mouse_capture);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("terminal text selection enabled")
+        );
+
+        handle_session_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .unwrap();
+
+        assert!(app.mouse_capture);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("mouse wheel scrolling enabled")
+        );
+    }
+
+    #[test]
+    fn focused_session_defaults_to_text_selection() {
+        let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
+
+        focus_selected_session(&mut app);
+
+        assert!(matches!(app.mode, Mode::Session(_)));
+        assert!(!app.mouse_capture);
+        assert!(!wants_mouse_capture(&app));
+    }
+
+    #[test]
+    fn mouse_capture_is_enabled_for_preview_and_session() {
+        let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
+        assert!(wants_mouse_capture(&app));
+
+        app.mode = Mode::Session(SendForm::default());
+        assert!(wants_mouse_capture(&app));
+
+        app.mouse_capture = false;
+        assert!(!wants_mouse_capture(&app));
     }
 
     #[test]
@@ -7308,6 +7421,7 @@ mod tests {
             status_filter: StatusFilter::All,
             sidebar_percent: DEFAULT_SIDEBAR_PERCENT,
             resizing_sidebar: false,
+            mouse_capture: true,
             animation_frame: 0,
             last_agent: "shell".to_string(),
             headroom_metrics: None,
