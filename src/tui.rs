@@ -2,8 +2,8 @@ use crate::{
     config::{ToolProfile, ToolWorktreeBehavior},
     error::{AppError, Result},
     models::{
-        CreateSession, DeleteMode, ForkSessionRequest, GroupRecord, SessionActivity,
-        SessionDeckStatus, SessionRecord, SessionStatus,
+        CreateSession, DeleteMode, ForkSessionRequest, GroupRecord, GroupSettingsUpdate,
+        SessionActivity, SessionDeckStatus, SessionRecord, SessionStatus,
     },
 };
 use crossterm::{
@@ -52,12 +52,15 @@ const ACTIVITY_ANIMATION_INTERVAL: Duration = Duration::from_millis(250);
 const SESSION_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const DETAILS_REFRESH_DEBOUNCE: Duration = Duration::from_millis(125);
 const PREVIEW_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
-const PREVIEW_SCROLL_LINES: u16 = 3;
+const PREVIEW_SCROLL_LINES: u16 = 1;
 const PREVIEW_MAX_SCROLL_LINES: u16 = 5000;
+const EMBEDDED_SCROLL_LINES: usize = 1;
 const EMBED_READ_BUF_SIZE: usize = 8192;
 const EMBED_MIN_ROWS: u16 = 2;
 const EMBED_MIN_COLS: u16 = 10;
+#[cfg(test)]
 const SGR_MOUSE_WHEEL_UP: u8 = 64;
+#[cfg(test)]
 const SGR_MOUSE_WHEEL_DOWN: u8 = 65;
 const DEFAULT_SIDEBAR_PERCENT: u16 = 24;
 const MIN_SIDEBAR_PERCENT: u16 = 18;
@@ -121,6 +124,8 @@ impl TuiLoop {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StatusCounts {
+    occupied: usize,
+    thinking: usize,
     running: usize,
     starting: usize,
     queued: usize,
@@ -133,6 +138,8 @@ pub struct StatusCounts {
 impl StatusCounts {
     fn add(&mut self, status: SessionDeckStatus) {
         match status {
+            SessionDeckStatus::Occupied => self.occupied += 1,
+            SessionDeckStatus::Thinking => self.thinking += 1,
             SessionDeckStatus::Running => self.running += 1,
             SessionDeckStatus::Starting => self.starting += 1,
             SessionDeckStatus::Queued => self.queued += 1,
@@ -382,7 +389,6 @@ pub enum TuiAction {
     Create(CreateSession),
     Attach(String),
     Stop(String),
-    Restart(String),
     Fork(ForkSessionRequest),
     Search {
         query: String,
@@ -391,6 +397,10 @@ pub enum TuiAction {
     CreateGroup {
         name: String,
         default_project_path: String,
+    },
+    UpdateGroup {
+        name: String,
+        update: GroupSettingsUpdate,
     },
     Remove {
         session_id: String,
@@ -404,6 +414,10 @@ pub enum TuiAction {
     MoveToGroup {
         session_id: String,
         group_name: String,
+    },
+    RenameSession {
+        session_id: String,
+        name: String,
     },
     SaveToolSettings(Vec<ToolLaunchSettings>),
 }
@@ -595,6 +609,7 @@ struct App {
     sessions: Vec<SessionRecord>,
     collapsed_groups: BTreeSet<String>,
     group_default_paths: BTreeMap<String, String>,
+    group_defaults: BTreeMap<String, GroupDefaults>,
     deck_statuses: BTreeMap<String, TuiSessionStatus>,
     details: TuiDetails,
     details_session_id: Option<String>,
@@ -626,16 +641,19 @@ fn app_from_initial(initial: TuiInitialState) -> App {
     let default_agent = normalized_agent(&initial.default_agent);
     let mut collapsed_groups = BTreeSet::new();
     let mut group_default_paths = BTreeMap::new();
+    let mut group_defaults = BTreeMap::new();
     for group in initial.groups {
         if group.collapsed {
             collapsed_groups.insert(group.name.clone());
         }
-        group_default_paths.insert(group.name, group.default_project_path);
+        group_default_paths.insert(group.name.clone(), group.default_project_path.clone());
+        group_defaults.insert(group.name.clone(), GroupDefaults::from(&group));
     }
     App {
         sessions: initial.sessions,
         collapsed_groups,
         group_default_paths,
+        group_defaults,
         deck_statuses: BTreeMap::new(),
         details: TuiDetails::default(),
         details_session_id: None,
@@ -1280,6 +1298,7 @@ fn encode_embedded_key(key: KeyEvent, application_cursor: bool) -> Option<Vec<u8
         KeyCode::Char(ch) => Some(encode_char_key(ch, ctrl, alt)),
         KeyCode::Enter => Some(b"\r".to_vec()),
         KeyCode::Tab => Some(b"\t".to_vec()),
+        KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
         KeyCode::Backspace if alt && !ctrl && !shift => Some(b"\x1b\x7f".to_vec()),
         KeyCode::Backspace => Some(b"\x7f".to_vec()),
         KeyCode::Esc => Some(b"\x1b".to_vec()),
@@ -1368,6 +1387,8 @@ fn modifier_code(shift: bool, ctrl: bool, alt: bool) -> u8 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusFilter {
     All,
+    Occupied,
+    Thinking,
     Running,
     Queued,
     Waiting,
@@ -1381,6 +1402,8 @@ impl StatusFilter {
     fn matches(self, status: SessionDeckStatus) -> bool {
         match self {
             Self::All => true,
+            Self::Occupied => status == SessionDeckStatus::Occupied,
+            Self::Thinking => status == SessionDeckStatus::Thinking,
             Self::Running => status == SessionDeckStatus::Running,
             Self::Queued => status == SessionDeckStatus::Queued,
             Self::Waiting => status == SessionDeckStatus::Waiting,
@@ -1393,7 +1416,9 @@ impl StatusFilter {
 
     fn next(self) -> Self {
         match self {
-            Self::All => Self::Running,
+            Self::All => Self::Occupied,
+            Self::Occupied => Self::Thinking,
+            Self::Thinking => Self::Running,
             Self::Running => Self::Queued,
             Self::Queued => Self::Waiting,
             Self::Waiting => Self::Idle,
@@ -1407,6 +1432,8 @@ impl StatusFilter {
     fn label(self) -> &'static str {
         match self {
             Self::All => "all",
+            Self::Occupied => "occupied",
+            Self::Thinking => "thinking",
             Self::Running => "running",
             Self::Queued => "queued",
             Self::Waiting => "waiting",
@@ -1424,9 +1451,11 @@ enum Mode {
     Search,
     New(NewForm),
     CreateGroup(GroupForm),
+    GroupSettings(GroupSettingsForm),
     Fork(ForkForm),
     Session(SendForm),
     Move(MoveForm),
+    Rename(RenameForm),
     ToolSettings(ToolSettingsForm),
     Help,
 }
@@ -1447,6 +1476,21 @@ impl MoveForm {
         Self {
             session_id: session.id.clone(),
             group_name: session.group_name.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenameForm {
+    session_id: String,
+    name: String,
+}
+
+impl RenameForm {
+    fn for_session(session: &SessionSummary) -> Self {
+        Self {
+            session_id: session.id.clone(),
+            name: session.name.clone(),
         }
     }
 }
@@ -1523,6 +1567,136 @@ impl GroupForm {
     fn previous_field(&mut self) {
         self.current_field = self.current_field.previous();
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupSettingsField {
+    DefaultPath,
+    DefaultAgent,
+    DefaultWorktree,
+    DefaultCarryState,
+}
+
+const GROUP_SETTINGS_FIELDS: [GroupSettingsField; 4] = [
+    GroupSettingsField::DefaultPath,
+    GroupSettingsField::DefaultAgent,
+    GroupSettingsField::DefaultWorktree,
+    GroupSettingsField::DefaultCarryState,
+];
+
+impl GroupSettingsField {
+    fn label(self) -> &'static str {
+        match self {
+            Self::DefaultPath => "Default working dir",
+            Self::DefaultAgent => "Default agent",
+            Self::DefaultWorktree => "Create worktree",
+            Self::DefaultCarryState => "Copy current state",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GroupSettingsForm {
+    name: String,
+    default_project_path: String,
+    default_agent: String,
+    default_worktree: Option<bool>,
+    default_carry_state: Option<bool>,
+    field_index: usize,
+}
+
+impl GroupSettingsForm {
+    fn from_group(group: &GroupDefaults) -> Self {
+        Self {
+            name: group.name.clone(),
+            default_project_path: group.default_project_path.clone(),
+            default_agent: group.default_agent.clone().unwrap_or_default(),
+            default_worktree: group.default_worktree,
+            default_carry_state: group.default_carry_state,
+            field_index: 0,
+        }
+    }
+
+    fn current_field(&self) -> GroupSettingsField {
+        GROUP_SETTINGS_FIELDS[self.field_index]
+    }
+
+    fn current_value_mut(&mut self) -> Option<&mut String> {
+        match self.current_field() {
+            GroupSettingsField::DefaultPath => Some(&mut self.default_project_path),
+            GroupSettingsField::DefaultAgent
+            | GroupSettingsField::DefaultWorktree
+            | GroupSettingsField::DefaultCarryState => None,
+        }
+    }
+
+    fn next_field(&mut self) {
+        self.field_index = (self.field_index + 1).min(GROUP_SETTINGS_FIELDS.len() - 1);
+    }
+
+    fn previous_field(&mut self) {
+        self.field_index = self.field_index.saturating_sub(1);
+    }
+
+    fn cycle_agent(&mut self, agent_choices: &[String], delta: isize) {
+        let mut choices = vec![String::new()];
+        choices.extend(effective_agent_choices(agent_choices, &self.default_agent));
+        let current = choices
+            .iter()
+            .position(|agent| agent == &self.default_agent)
+            .unwrap_or(0);
+        let next = (current as isize + delta).rem_euclid(choices.len() as isize) as usize;
+        self.default_agent = choices[next].clone();
+    }
+
+    fn cycle_worktree(&mut self, delta: isize) {
+        self.default_worktree = cycle_optional_bool(self.default_worktree, delta);
+    }
+
+    fn cycle_carry_state(&mut self, delta: isize) {
+        self.default_carry_state = cycle_optional_bool(self.default_carry_state, delta);
+    }
+
+    fn update(&self) -> GroupSettingsUpdate {
+        GroupSettingsUpdate {
+            default_project_path: Some(self.default_project_path.trim().to_string()),
+            default_agent: Some(non_empty(self.default_agent.trim())),
+            default_worktree: Some(self.default_worktree),
+            default_carry_state: Some(self.default_carry_state),
+            ..GroupSettingsUpdate::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GroupDefaults {
+    name: String,
+    default_project_path: String,
+    default_agent: Option<String>,
+    default_worktree: Option<bool>,
+    default_carry_state: Option<bool>,
+}
+
+impl From<&GroupRecord> for GroupDefaults {
+    fn from(group: &GroupRecord) -> Self {
+        Self {
+            name: group.name.clone(),
+            default_project_path: group.default_project_path.clone(),
+            default_agent: group.default_agent.clone(),
+            default_worktree: group.default_worktree,
+            default_carry_state: group.default_carry_state,
+        }
+    }
+}
+
+fn cycle_optional_bool(value: Option<bool>, delta: isize) -> Option<bool> {
+    let values = [None, Some(true), Some(false)];
+    let current = values
+        .iter()
+        .position(|candidate| *candidate == value)
+        .unwrap_or(0);
+    let next = (current as isize + delta).rem_euclid(values.len() as isize) as usize;
+    values[next]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1749,6 +1923,7 @@ struct NewForm {
     worktree: bool,
     carry_state: bool,
     field_index: usize,
+    launching: bool,
 }
 
 impl Default for NewForm {
@@ -1762,6 +1937,7 @@ impl Default for NewForm {
             worktree: false,
             carry_state: false,
             field_index: 0,
+            launching: false,
         }
     }
 }
@@ -1880,10 +2056,17 @@ impl NewForm {
 
 fn new_form_for_agent(app: &App, agent: &str) -> NewForm {
     let mut form = NewForm::with_agent(agent);
-    select_existing_group(&mut form.group_name, &app.group_default_paths);
-    apply_group_default_path(&mut form, &app.group_default_paths);
-    form.worktree = tool_creates_worktree_by_default(&app.tool_settings, &form.agent);
+    if let Some(group_name) = active_group_name(app) {
+        form.group_name = group_name;
+    } else {
+        select_existing_group(&mut form.group_name, &app.group_default_paths);
+    }
+    apply_group_defaults(&mut form, app);
     form
+}
+
+fn active_group_name(app: &App) -> Option<String> {
+    app.view().selected.map(|session| session.group_name)
 }
 
 fn new_form_for_session(app: &App, session: &SessionSummary) -> NewForm {
@@ -1891,6 +2074,40 @@ fn new_form_for_session(app: &App, session: &SessionSummary) -> NewForm {
     select_existing_group(&mut form.group_name, &app.group_default_paths);
     form.worktree = tool_creates_worktree_by_default(&app.tool_settings, &form.agent);
     form
+}
+
+fn apply_group_defaults(form: &mut NewForm, app: &App) {
+    apply_group_defaults_from_maps(form, &app.group_defaults, &app.tool_settings);
+}
+
+fn apply_group_defaults_from_maps(
+    form: &mut NewForm,
+    group_defaults: &BTreeMap<String, GroupDefaults>,
+    tool_settings: &[ToolLaunchSettings],
+) {
+    if let Some(group) = group_defaults.get(&form.group_name) {
+        apply_group_default_settings(form, group, tool_settings);
+        return;
+    }
+    form.worktree = tool_creates_worktree_by_default(tool_settings, &form.agent);
+    form.carry_state = false;
+}
+
+fn apply_group_default_settings(
+    form: &mut NewForm,
+    group: &GroupDefaults,
+    tool_settings: &[ToolLaunchSettings],
+) {
+    if !group.default_project_path.trim().is_empty() {
+        form.path = group.default_project_path.clone();
+    }
+    if let Some(agent) = &group.default_agent {
+        form.agent = normalized_agent(agent);
+    }
+    form.worktree = group
+        .default_worktree
+        .unwrap_or_else(|| tool_creates_worktree_by_default(tool_settings, &form.agent));
+    form.carry_state = group.default_carry_state.unwrap_or(false);
 }
 
 fn group_default_path<'a>(
@@ -2466,13 +2683,15 @@ fn tmux_target_for_session(session: &SessionSummary) -> String {
         .unwrap_or_else(|| tmux_session_name_for_id(&session.id))
 }
 
-fn process_key<F>(
-    _terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+fn process_key<B, F>(
+    terminal: &mut Terminal<B>,
     app: &mut App,
     handle_action: &mut F,
     key: KeyEvent,
 ) -> Result<bool>
 where
+    B: ratatui::backend::Backend,
+    B::Error: std::fmt::Display,
     F: FnMut(TuiAction) -> Result<Vec<SessionRecord>>,
 {
     if matches!(app.mode, Mode::Normal | Mode::Search) && is_plain_ctrl_key(key, 't') {
@@ -2490,11 +2709,22 @@ where
             }
         }
         Mode::Search => handle_search_key(key, app, handle_action)?,
-        Mode::New(_) => handle_new_key(key, app, handle_action)?,
+        Mode::New(_) => {
+            if new_key_submits(app, key) {
+                set_new_form_launching(app, true);
+                app.status_message = None;
+                terminal
+                    .draw(|frame| render(frame, app))
+                    .map_err(|err| AppError::msg(format!("draw launch feedback: {err}")))?;
+            }
+            handle_new_key(key, app, handle_action)?;
+        }
         Mode::CreateGroup(_) => handle_create_group_key(key, app, handle_action)?,
+        Mode::GroupSettings(_) => handle_group_settings_key(key, app, handle_action)?,
         Mode::Fork(_) => handle_fork_key(key, app, handle_action)?,
         Mode::Session(_) => handle_session_key(key, app)?,
         Mode::Move(_) => handle_move_key(key, app, handle_action)?,
+        Mode::Rename(_) => handle_rename_key(key, app, handle_action)?,
         Mode::ToolSettings(_) => handle_tool_settings_key(key, app, handle_action)?,
         Mode::Help => handle_help_key(key, app),
     }
@@ -2503,6 +2733,10 @@ where
 
 fn is_plain_ctrl_key(key: KeyEvent, ch: char) -> bool {
     key.code == KeyCode::Char(ch) && key.modifiers == KeyModifiers::CONTROL
+}
+
+fn is_plain_char_key(key: KeyEvent, ch: char) -> bool {
+    key.code == KeyCode::Char(ch) && key.modifiers == KeyModifiers::NONE
 }
 
 fn toggle_mouse_capture(app: &mut App) {
@@ -2516,6 +2750,23 @@ fn toggle_mouse_capture(app: &mut App) {
 
 fn is_global_quit_key(key: KeyEvent, mode: &Mode) -> bool {
     is_plain_ctrl_key(key, 'c') && !matches!(mode, Mode::Session(_))
+}
+
+fn new_key_submits(app: &App, key: KeyEvent) -> bool {
+    let Mode::New(form) = &app.mode else {
+        return false;
+    };
+    match key.code {
+        KeyCode::Enter => form.field_index == NEW_FIELDS.len() - 1,
+        KeyCode::Char('s') => key.modifiers.contains(KeyModifiers::CONTROL),
+        _ => false,
+    }
+}
+
+fn set_new_form_launching(app: &mut App, launching: bool) {
+    if let Mode::New(form) = &mut app.mode {
+        form.launching = launching;
+    }
 }
 
 fn process_mouse(app: &mut App, mouse: MouseEvent, area: Rect) -> bool {
@@ -2556,14 +2807,29 @@ fn scroll_embedded_session(app: &mut App, mouse: MouseEvent, area: Rect) -> bool
         },
         app.sidebar_percent,
     );
-    let Some(bytes) = encode_embedded_mouse_wheel(mouse, terminal_area) else {
+    if !point_in_rect(mouse.column, mouse.row, terminal_area) {
         return false;
     };
-    let Some(embedded) = app.embedded.as_mut() else {
+    let direction = match mouse.kind {
+        MouseEventKind::ScrollUp => TmuxScrollDirection::Up,
+        MouseEventKind::ScrollDown => TmuxScrollDirection::Down,
+        _ => return false,
+    };
+    let Some(target) = app
+        .embedded
+        .as_ref()
+        .map(|embedded| embedded.target.clone())
+    else {
         return false;
     };
-    match embedded.write_bytes(&bytes) {
-        Ok(()) => true,
+
+    match scroll_tmux_history(&target, direction) {
+        Ok(()) => {
+            if let Some(embedded) = app.embedded.as_mut() {
+                embedded.drain();
+            }
+            true
+        }
         Err(err) => {
             app.status_message = Some(format!("scroll failed: {err}"));
             false
@@ -2571,6 +2837,50 @@ fn scroll_embedded_session(app: &mut App, mouse: MouseEvent, area: Rect) -> bool
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum TmuxScrollDirection {
+    Up,
+    Down,
+}
+
+fn scroll_tmux_history(target: &str, direction: TmuxScrollDirection) -> Result<()> {
+    if matches!(direction, TmuxScrollDirection::Up) {
+        let status = Command::new("tmux")
+            .arg("copy-mode")
+            .arg("-e")
+            .arg("-t")
+            .arg(target)
+            .status()
+            .map_err(|err| AppError::msg(format!("enter tmux copy mode: {err}")))?;
+        if !status.success() {
+            return Err(AppError::msg(format!("enter tmux copy mode: {status}")));
+        }
+    }
+
+    let command = match direction {
+        TmuxScrollDirection::Up => "scroll-up",
+        TmuxScrollDirection::Down => "scroll-down",
+    };
+    for _ in 0..EMBEDDED_SCROLL_LINES {
+        let status = Command::new("tmux")
+            .arg("send-keys")
+            .arg("-t")
+            .arg(target)
+            .arg("-X")
+            .arg(command)
+            .status()
+            .map_err(|err| AppError::msg(format!("scroll tmux history: {err}")))?;
+        if !status.success() {
+            if matches!(direction, TmuxScrollDirection::Down) {
+                return Ok(());
+            }
+            return Err(AppError::msg(format!("scroll tmux history: {status}")));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn encode_embedded_mouse_wheel(mouse: MouseEvent, area: Rect) -> Option<Vec<u8>> {
     if !point_in_rect(mouse.column, mouse.row, area) {
         return None;
@@ -2601,7 +2911,6 @@ fn scroll_session_preview(app: &mut App, delta: i16) -> bool {
 fn focus_selected_session(app: &mut App) {
     if selected_id(app).is_some() {
         app.detail_scroll = 0;
-        app.mouse_capture = false;
         app.mode = Mode::Session(SendForm::default());
         app.status_message = None;
     } else {
@@ -2749,12 +3058,18 @@ fn handle_normal_key<F>(key: KeyEvent, app: &mut App, handle_action: &mut F) -> 
 where
     F: FnMut(TuiAction) -> Result<Vec<SessionRecord>>,
 {
+    if is_plain_char_key(key, 'q')
+        || (key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE)
+    {
+        return Ok(true);
+    }
+
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
         KeyCode::Char('?') | KeyCode::Char('h') => app.mode = Mode::Help,
         KeyCode::Char('/') => app.mode = Mode::Search,
         KeyCode::Char('c') => toggle_selected_group(app, handle_action)?,
         KeyCode::Char('e') => expand_groups(app, handle_action)?,
+        KeyCode::Char('E') => open_group_settings(app),
         KeyCode::Char('g') => open_tool_settings(app),
         KeyCode::Char('G') => {
             app.mode = Mode::CreateGroup(GroupForm::new());
@@ -2789,7 +3104,12 @@ where
             }
         }
         KeyCode::Char('r') => {
-            run_selected_action(app, handle_action, TuiAction::Restart, "restarted")?
+            if let Some(session) = app.view().selected {
+                app.mode = Mode::Rename(RenameForm::for_session(&session));
+                app.status_message = None;
+            } else {
+                app.status_message = Some("no session selected".to_string());
+            }
         }
         KeyCode::Char('d') => run_selected_action(
             app,
@@ -2846,6 +3166,19 @@ fn reset_detail_view(app: &mut App) {
 
 fn open_tool_settings(app: &mut App) {
     app.mode = Mode::ToolSettings(ToolSettingsForm::new(&app.tool_settings, &app.last_agent));
+    app.status_message = None;
+}
+
+fn open_group_settings(app: &mut App) {
+    let Some(session) = app.view().selected else {
+        app.status_message = Some("no group selected".to_string());
+        return;
+    };
+    let Some(group) = app.group_defaults.get(&session.group_name) else {
+        app.status_message = Some(format!("group not found: {}", session.group_name));
+        return;
+    };
+    app.mode = Mode::GroupSettings(GroupSettingsForm::from_group(group));
     app.status_message = None;
 }
 
@@ -3003,6 +3336,7 @@ where
     let agent_choices = app.agent_choices.clone();
     let tool_settings = app.tool_settings.clone();
     let group_default_paths = app.group_default_paths.clone();
+    let group_defaults = app.group_defaults.clone();
 
     if let Mode::New(form) = &mut app.mode {
         match key.code {
@@ -3011,23 +3345,23 @@ where
                 let apply_group_path = form.current_field() == NewField::Group;
                 form.next_field();
                 if apply_group_path {
-                    apply_group_default_path(form, &group_default_paths);
+                    apply_group_defaults_from_maps(form, &group_defaults, &tool_settings);
                 }
             }
             KeyCode::BackTab | KeyCode::Up => {
                 let apply_group_path = form.current_field() == NewField::Group;
                 form.previous_field();
                 if apply_group_path {
-                    apply_group_default_path(form, &group_default_paths);
+                    apply_group_defaults_from_maps(form, &group_defaults, &tool_settings);
                 }
             }
             KeyCode::Left if form.current_field() == NewField::Group => {
                 cycle_group_name(&mut form.group_name, &group_default_paths, -1);
-                apply_group_default_path(form, &group_default_paths);
+                apply_group_defaults_from_maps(form, &group_defaults, &tool_settings);
             }
             KeyCode::Right if form.current_field() == NewField::Group => {
                 cycle_group_name(&mut form.group_name, &group_default_paths, 1);
-                apply_group_default_path(form, &group_default_paths);
+                apply_group_defaults_from_maps(form, &group_defaults, &tool_settings);
             }
             KeyCode::Left if form.current_field() == NewField::Agent => {
                 form.cycle_agent(&agent_choices, -1);
@@ -3087,6 +3421,7 @@ where
             Mode::New(form) => match form.build_request() {
                 Ok(request) => request,
                 Err(message) => {
+                    set_new_form_launching(app, false);
                     app.status_message = Some(message.to_string());
                     return Ok(());
                 }
@@ -3114,6 +3449,7 @@ where
                 app.status_message = Some("created session".to_string());
             }
             Err(err) => {
+                set_new_form_launching(app, false);
                 app.status_message = Some(format!("create failed: {err}"));
             }
         }
@@ -3175,7 +3511,17 @@ where
         }) {
             Ok(sessions) => {
                 app.group_default_paths
-                    .insert(name.clone(), default_project_path);
+                    .insert(name.clone(), default_project_path.clone());
+                app.group_defaults.insert(
+                    name.clone(),
+                    GroupDefaults {
+                        name: name.clone(),
+                        default_project_path,
+                        default_agent: None,
+                        default_worktree: None,
+                        default_carry_state: None,
+                    },
+                );
                 app.sessions = sessions;
                 app.mode = Mode::Normal;
                 app.status_message = Some(format!("created group {name}"));
@@ -3185,6 +3531,99 @@ where
             }
         }
     }
+    Ok(())
+}
+
+fn handle_group_settings_key<F>(key: KeyEvent, app: &mut App, handle_action: &mut F) -> Result<()>
+where
+    F: FnMut(TuiAction) -> Result<Vec<SessionRecord>>,
+{
+    let mut submit = false;
+    let agent_choices = app.agent_choices.clone();
+    if let Mode::GroupSettings(form) = &mut app.mode {
+        match key.code {
+            KeyCode::Esc => app.mode = Mode::Normal,
+            KeyCode::Tab | KeyCode::Down => form.next_field(),
+            KeyCode::BackTab | KeyCode::Up => form.previous_field(),
+            KeyCode::Enter => {
+                if form.field_index == GROUP_SETTINGS_FIELDS.len() - 1 {
+                    submit = true;
+                } else {
+                    form.next_field();
+                }
+            }
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                submit = true;
+            }
+            KeyCode::Left if form.current_field() == GroupSettingsField::DefaultAgent => {
+                form.cycle_agent(&agent_choices, -1);
+            }
+            KeyCode::Right if form.current_field() == GroupSettingsField::DefaultAgent => {
+                form.cycle_agent(&agent_choices, 1);
+            }
+            KeyCode::Left if form.current_field() == GroupSettingsField::DefaultWorktree => {
+                form.cycle_worktree(-1);
+            }
+            KeyCode::Right | KeyCode::Char(' ')
+                if form.current_field() == GroupSettingsField::DefaultWorktree =>
+            {
+                form.cycle_worktree(1);
+            }
+            KeyCode::Left if form.current_field() == GroupSettingsField::DefaultCarryState => {
+                form.cycle_carry_state(-1);
+            }
+            KeyCode::Right | KeyCode::Char(' ')
+                if form.current_field() == GroupSettingsField::DefaultCarryState =>
+            {
+                form.cycle_carry_state(1);
+            }
+            KeyCode::Backspace => {
+                if let Some(value) = form.current_value_mut() {
+                    value.pop();
+                }
+            }
+            KeyCode::Char(ch) => {
+                if let Some(value) = form.current_value_mut() {
+                    value.push(ch);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if submit {
+        let (name, update) = match &app.mode {
+            Mode::GroupSettings(form) => (form.name.clone(), form.update()),
+            _ => return Ok(()),
+        };
+        match handle_action(TuiAction::UpdateGroup {
+            name: name.clone(),
+            update: update.clone(),
+        }) {
+            Ok(sessions) => {
+                app.sessions = sessions;
+                if let Some(path) = update.default_project_path {
+                    app.group_default_paths.insert(name.clone(), path.clone());
+                    app.group_defaults.insert(
+                        name.clone(),
+                        GroupDefaults {
+                            name: name.clone(),
+                            default_project_path: path,
+                            default_agent: update.default_agent.flatten(),
+                            default_worktree: update.default_worktree.flatten(),
+                            default_carry_state: update.default_carry_state.flatten(),
+                        },
+                    );
+                }
+                app.mode = Mode::Normal;
+                app.status_message = Some(format!("updated group {name}"));
+            }
+            Err(err) => {
+                app.status_message = Some(format!("update group failed: {err}"));
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -3342,6 +3781,51 @@ where
                 app.status_message = Some("moved session".to_string());
             }
             Err(err) => app.status_message = Some(format!("move failed: {err}")),
+        }
+    }
+    Ok(())
+}
+
+fn handle_rename_key<F>(key: KeyEvent, app: &mut App, handle_action: &mut F) -> Result<()>
+where
+    F: FnMut(TuiAction) -> Result<Vec<SessionRecord>>,
+{
+    let mut submit = false;
+    if let Mode::Rename(form) = &mut app.mode {
+        match key.code {
+            KeyCode::Esc => app.mode = Mode::Normal,
+            KeyCode::Enter => submit = true,
+            KeyCode::Backspace => {
+                form.name.pop();
+            }
+            KeyCode::Char(ch) => form.name.push(ch),
+            _ => {}
+        }
+    }
+
+    if submit {
+        let (session_id, name) = match &app.mode {
+            Mode::Rename(form) => (form.session_id.clone(), form.name.trim().to_string()),
+            _ => return Ok(()),
+        };
+        if name.is_empty() {
+            app.status_message = Some("name required".to_string());
+            return Ok(());
+        }
+        match handle_action(TuiAction::RenameSession {
+            session_id: session_id.clone(),
+            name,
+        }) {
+            Ok(sessions) => {
+                app.sessions = sessions;
+                if app.search_results_active && !app.query.trim().is_empty() {
+                    refresh_sessions(app, handle_action)?;
+                }
+                select_matching_session(app, |session| session.id == session_id);
+                app.mode = Mode::Normal;
+                app.status_message = Some("renamed session".to_string());
+            }
+            Err(err) => app.status_message = Some(format!("rename failed: {err}")),
         }
     }
     Ok(())
@@ -3621,9 +4105,16 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         Mode::CreateGroup(form) => {
             frame.render_widget(create_group_form(form, &app.status_message), body.detail)
         }
+        Mode::GroupSettings(form) => frame.render_widget(
+            group_settings_form(form, &app.agent_choices, &app.status_message),
+            body.detail,
+        ),
         Mode::Fork(form) => frame.render_widget(fork_form(form, &app.status_message), body.detail),
         Mode::Session(_) => render_session_terminal(frame, app, &view, body.detail),
         Mode::Move(form) => frame.render_widget(move_form(form, &app.status_message), body.detail),
+        Mode::Rename(form) => {
+            frame.render_widget(rename_form(form, &app.status_message), body.detail)
+        }
         Mode::ToolSettings(form) => {
             frame.render_widget(detail_panel(app, &view), body.detail);
             let popup = tool_settings_popup_area(frame.area());
@@ -3677,8 +4168,8 @@ fn header(app: &App, view: &DashboardView) -> Paragraph<'static> {
     let mut filters = vec![
         Span::styled(app.status_filter.label(), badge_style()),
         Span::raw(format!(
-            "  {} queued  {} waiting  {} idle",
-            counts.queued, counts.waiting, counts.idle
+            "  {} occupied  {} thinking  {} queued  {} waiting  {} idle",
+            counts.occupied, counts.thinking, counts.queued, counts.waiting, counts.idle
         )),
         Span::raw(format!("  {} visible", view.visible_count)),
         Span::raw(format!("  filter {search}")),
@@ -3693,8 +4184,13 @@ fn header(app: &App, view: &DashboardView) -> Paragraph<'static> {
             Span::styled("< ", muted_style()),
             Span::styled("Agent Helm", accent_style().add_modifier(Modifier::BOLD)),
             Span::raw(format!(
-                "  * {} running  > {} starting  o {} stopped  ! {} errored",
-                counts.running, counts.starting, counts.stopped, counts.errored
+                "  x{} ~{} *{} >{} o{} !{}",
+                counts.occupied,
+                counts.thinking,
+                counts.running,
+                counts.starting,
+                counts.stopped,
+                counts.errored
             )),
             Span::styled(format!("  v{}", env!("CARGO_PKG_VERSION")), muted_style()),
             app.headroom_metrics
@@ -3757,11 +4253,6 @@ fn session_list(view: &DashboardView, animation_frame: usize) -> (List<'static>,
                 Span::styled(session_pr_label(session.pr_number), pr_style()),
                 Span::raw(" "),
                 Span::styled(session.agent.clone(), agent_style(&session.agent)),
-                Span::raw(" "),
-                Span::styled(
-                    session.deck_status.as_str(),
-                    deck_status_style(session.deck_status),
-                ),
             ];
             if let Some(label) = session_activity_label(session) {
                 row.push(Span::raw(" "));
@@ -3912,7 +4403,8 @@ fn help_panel() -> Paragraph<'static> {
         Line::from(""),
         section_line("Actions"),
         Line::from("n new session | Ctrl-n shell | N duplicate | m move group"),
-        Line::from("r restart | f fork | d delete | D delete and clean up"),
+        Line::from("G create group | E edit selected group defaults"),
+        Line::from("f fork | d delete | D delete and clean up"),
         Line::from("g opens profile tool settings"),
         Line::from(""),
         section_line("Filters"),
@@ -3964,7 +4456,9 @@ fn dashboard_lines(app: &App, view: &DashboardView) -> Vec<Line<'static>> {
             )),
         ]),
         Line::from(format!(
-            "* {} running   > {} starting   : {} queued   ? {} waiting   - {} idle   o {} stopped   ! {} errored",
+            "x {} occupied   ~ {} thinking   * {} running   > {} starting   : {} queued   ? {} waiting   - {} idle   o {} stopped   ! {} errored",
+            counts.occupied,
+            counts.thinking,
             counts.running,
             counts.starting,
             counts.queued,
@@ -3980,9 +4474,11 @@ fn dashboard_lines(app: &App, view: &DashboardView) -> Vec<Line<'static>> {
     for group in &view.groups {
         let counts = group_status_counts(group);
         lines.push(Line::from(format!(
-            "{}  {} sessions  *{} >{} :{} ?{} -{} o{} !{}",
+            "{}  {} sessions  x{} ~{} *{} >{} :{} ?{} -{} o{} !{}",
             group.name,
             group.sessions.len(),
+            counts.occupied,
+            counts.thinking,
             counts.running,
             counts.starting,
             counts.queued,
@@ -4139,33 +4635,86 @@ fn group_status_counts(group: &SessionGroup) -> StatusCounts {
 }
 
 fn session_activity_marker(session: &SessionSummary, animation_frame: usize) -> &'static str {
+    let active = session_has_active_activity(session);
     match session.deck_status {
-        SessionDeckStatus::Running | SessionDeckStatus::Starting => {
-            const FRAMES: [&str; 4] = [".", "o", "O", "o"];
+        SessionDeckStatus::Occupied if active => {
+            const FRAMES: [&str; 2] = ["◆", "◇"];
             FRAMES[animation_frame % FRAMES.len()]
         }
-        SessionDeckStatus::Queued => ":",
-        SessionDeckStatus::Waiting => "?",
-        SessionDeckStatus::Idle => "-",
-        SessionDeckStatus::Stopped => "o",
-        SessionDeckStatus::Errored => "!",
+        SessionDeckStatus::Thinking if active => {
+            const FRAMES: [&str; 2] = ["✦", "✧"];
+            FRAMES[animation_frame % FRAMES.len()]
+        }
+        SessionDeckStatus::Running if active => {
+            const FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
+            FRAMES[animation_frame % FRAMES.len()]
+        }
+        SessionDeckStatus::Starting if active => {
+            const FRAMES: [&str; 2] = ["▸", "▹"];
+            FRAMES[animation_frame % FRAMES.len()]
+        }
+        SessionDeckStatus::Occupied => "◆",
+        SessionDeckStatus::Thinking => "✦",
+        SessionDeckStatus::Running => "●",
+        SessionDeckStatus::Starting => "▸",
+        SessionDeckStatus::Queued => "⋯",
+        SessionDeckStatus::Waiting => "◌",
+        SessionDeckStatus::Idle => "·",
+        SessionDeckStatus::Stopped => "■",
+        SessionDeckStatus::Errored => "×",
     }
 }
 
 fn session_activity_style(session: &SessionSummary) -> Style {
     match session.deck_status {
-        SessionDeckStatus::Running | SessionDeckStatus::Starting => agent_style(&session.agent),
+        SessionDeckStatus::Occupied
+        | SessionDeckStatus::Thinking
+        | SessionDeckStatus::Running
+        | SessionDeckStatus::Starting => agent_style(&session.agent),
         status => deck_status_style(status),
     }
 }
 
 fn session_activity_label(session: &SessionSummary) -> Option<&str> {
-    let label = session.activity.as_ref()?.label.trim();
-    if label.is_empty() || label.eq_ignore_ascii_case(session.deck_status.as_str()) {
+    let activity = session.activity.as_ref()?;
+    if activity.source == "runtime_start" {
+        return None;
+    }
+    let label = activity.label.trim();
+    if label.is_empty()
+        || label.eq_ignore_ascii_case(session.deck_status.as_str())
+        || activity_tool_matches_agent(activity, session)
+        || (label.eq_ignore_ascii_case("working") && activity.tool.is_none())
+    {
         None
     } else {
         Some(label)
     }
+}
+
+fn session_has_active_activity(session: &SessionSummary) -> bool {
+    let Some(activity) = session.activity.as_ref() else {
+        return false;
+    };
+    if activity.source == "runtime_start" {
+        return false;
+    }
+    matches!(
+        activity.state.trim().to_ascii_lowercase().as_str(),
+        "occupied" | "running" | "busy" | "working" | "thinking"
+    )
+}
+
+fn activity_tool_matches_agent(activity: &SessionActivity, session: &SessionSummary) -> bool {
+    activity
+        .tool
+        .as_deref()
+        .is_some_and(|tool| tool.eq_ignore_ascii_case(&session.agent))
+        || activity
+            .label
+            .trim()
+            .strip_prefix("using ")
+            .is_some_and(|tool| tool.eq_ignore_ascii_case(&session.agent))
 }
 
 fn activity_label_style(session: &SessionSummary) -> Style {
@@ -4174,6 +4723,8 @@ fn activity_label_style(session: &SessionSummary) -> Style {
 
 fn deck_status_label(status: SessionDeckStatus) -> &'static str {
     match status {
+        SessionDeckStatus::Occupied => "x occupied",
+        SessionDeckStatus::Thinking => "~ thinking",
         SessionDeckStatus::Running => "* running",
         SessionDeckStatus::Starting => "> starting",
         SessionDeckStatus::Queued => ": queued",
@@ -4361,6 +4912,10 @@ fn text_entry_spans(form: &NewForm, field: NewField, active: bool) -> Vec<Span<'
 }
 
 fn new_form_cursor_position(form: &NewForm, area: Rect) -> Option<(u16, u16)> {
+    if form.launching {
+        return None;
+    }
+
     let field = form.current_field();
     if !field.is_text_entry() || area.width < 4 || area.height < 3 {
         return None;
@@ -4418,6 +4973,14 @@ fn create_form(
             _ => spans.push(Span::raw(form.field_value(field).to_string())),
         }
         lines.push(Line::from(spans));
+    }
+
+    if form.launching {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Launching session...",
+            accent_style().add_modifier(Modifier::BOLD),
+        )));
     }
 
     if let Some(message) = status_message {
@@ -4561,6 +5124,108 @@ fn tool_settings_form(
         .wrap(Wrap { trim: false })
 }
 
+fn group_settings_form(
+    form: &GroupSettingsForm,
+    agent_choices: &[String],
+    status_message: &Option<String>,
+) -> Paragraph<'static> {
+    let mut lines = vec![Line::from(vec![
+        Span::styled("Group ", muted_style()),
+        Span::styled(form.name.clone(), title_style()),
+    ])];
+    for field in GROUP_SETTINGS_FIELDS {
+        let active = field == form.current_field();
+        let marker = if active { ">" } else { " " };
+        let style = if active {
+            title_style()
+        } else {
+            Style::default()
+        };
+        let mut spans = vec![
+            Span::styled(marker, style),
+            Span::raw(" "),
+            Span::styled(format!("{:<18}", field.label()), style),
+            Span::raw(" "),
+        ];
+        match field {
+            GroupSettingsField::DefaultPath => {
+                let value_style = text_entry_style(active, false);
+                spans.extend([
+                    Span::styled("[", border_style()),
+                    Span::styled(" ", value_style),
+                    Span::styled(form.default_project_path.clone(), value_style),
+                    Span::styled(" ", value_style),
+                    Span::styled("]", border_style()),
+                ]);
+            }
+            GroupSettingsField::DefaultAgent => {
+                spans.extend(group_settings_agent_spans(form, agent_choices));
+            }
+            GroupSettingsField::DefaultWorktree => {
+                spans.push(Span::raw(optional_bool_label(form.default_worktree)));
+            }
+            GroupSettingsField::DefaultCarryState => {
+                spans.push(Span::raw(optional_bool_label(form.default_carry_state)));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    if let Some(message) = status_message {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            message.clone(),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    Paragraph::new(lines)
+        .block(panel_block("GROUP SETTINGS"))
+        .wrap(Wrap { trim: false })
+}
+
+fn group_settings_agent_spans(
+    form: &GroupSettingsForm,
+    agent_choices: &[String],
+) -> Vec<Span<'static>> {
+    let mut choices = vec![String::new()];
+    choices.extend(effective_agent_choices(agent_choices, &form.default_agent));
+    choices
+        .into_iter()
+        .enumerate()
+        .flat_map(|(index, agent)| {
+            let selected = agent == form.default_agent;
+            let label = if agent.is_empty() {
+                "inherit".to_string()
+            } else {
+                agent
+            };
+            let label = if selected {
+                format!("[{label}]")
+            } else {
+                label
+            };
+            let style = if selected {
+                title_style()
+            } else {
+                muted_style()
+            };
+            let mut spans = Vec::new();
+            if index > 0 {
+                spans.push(Span::raw(" "));
+            }
+            spans.push(Span::styled(label, style));
+            spans
+        })
+        .collect()
+}
+
+fn optional_bool_label(value: Option<bool>) -> &'static str {
+    match value {
+        None => "inherit",
+        Some(true) => "[x]",
+        Some(false) => "[ ]",
+    }
+}
+
 fn fork_form(form: &ForkForm, status_message: &Option<String>) -> Paragraph<'static> {
     let mut lines = vec![Line::from(vec![
         Span::styled("Parent", muted_style()),
@@ -4622,6 +5287,24 @@ fn move_form(form: &MoveForm, status_message: &Option<String>) -> Paragraph<'sta
         .wrap(Wrap { trim: false })
 }
 
+fn rename_form(form: &RenameForm, status_message: &Option<String>) -> Paragraph<'static> {
+    let mut lines = vec![Line::from(vec![
+        Span::styled(">", title_style()),
+        Span::raw(" Name "),
+        Span::raw(form.name.clone()),
+    ])];
+    if let Some(message) = status_message {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            message.clone(),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    Paragraph::new(lines)
+        .block(panel_block("RENAME SESSION"))
+        .wrap(Wrap { trim: false })
+}
+
 fn footer(app: &App) -> Paragraph<'static> {
     let text = footer_text(app);
     Paragraph::new(Line::from(vec![Span::styled(text, muted_style())]))
@@ -4636,18 +5319,25 @@ fn footer_text(app: &App) -> String {
         Mode::CreateGroup(_) => {
             "Create group: Tab field | Enter next/create | Ctrl-S create | Esc cancel".to_string()
         }
+        Mode::GroupSettings(_) => {
+            "Group settings: Tab field | Left/Right cycle | Ctrl-S save | Esc cancel".to_string()
+        }
         Mode::Fork(_) => "Fork: Tab field | Enter next/fork | Ctrl-S fork | Esc cancel".to_string(),
         Mode::Session(_) => {
-            "Session: interactive tmux viewport | Ctrl-q dashboard | Ctrl-t mouse/select"
-                .to_string()
+            if app.mouse_capture {
+                "Session: wheel scroll mode | Ctrl-q dashboard | Ctrl-t text selection".to_string()
+            } else {
+                "Session: text selection mode | Ctrl-q dashboard | Ctrl-t wheel scroll".to_string()
+            }
         }
         Mode::Move(_) => "Move: type group | Enter move | Esc cancel".to_string(),
+        Mode::Rename(_) => "Rename: type name | Enter rename | Esc cancel".to_string(),
         Mode::ToolSettings(_) => {
             "Profile tools: Tab field | Left/Right cycle | Space toggle | Ctrl-S save | Esc cancel".to_string()
         }
         Mode::Help => "Help: Esc/q close".to_string(),
         Mode::Normal => {
-            "Enter session m move r restart f fork d delete D cleanup | n new Ctrl-n shell N duplicate | g tools | Ctrl-t mouse/select | j/k nav c/e groups Pg scroll / search t status ? help q quit".to_string()
+            "Enter session r rename m move f fork d delete D cleanup | n new Ctrl-n shell N duplicate | G new group E edit group | g tools | Ctrl-t mouse/select | j/k nav c/e groups Pg scroll / search t status ? help q quit".to_string()
         }
     }
 }
@@ -4663,6 +5353,8 @@ fn status_style(status: SessionStatus) -> Style {
 
 fn deck_status_style(status: SessionDeckStatus) -> Style {
     match status {
+        SessionDeckStatus::Occupied => accent_style(),
+        SessionDeckStatus::Thinking => Style::default().fg(Color::Rgb(189, 147, 249)),
         SessionDeckStatus::Running => accent_style(),
         SessionDeckStatus::Starting | SessionDeckStatus::Queued => {
             Style::default().fg(Color::Rgb(255, 184, 108))
@@ -5176,10 +5868,16 @@ mod tests {
     #[test]
     fn group_counts_use_deck_status_over_lifecycle_status() {
         let running = record("1", "ops", "deploy", false);
-        let statuses = BTreeMap::from([("1".to_string(), SessionDeckStatus::Waiting.into())]);
+        let thinking = record("2", "ops", "plan", false);
+        let occupied = record("3", "ops", "build", false);
+        let statuses = BTreeMap::from([
+            ("1".to_string(), SessionDeckStatus::Waiting.into()),
+            ("2".to_string(), SessionDeckStatus::Thinking.into()),
+            ("3".to_string(), SessionDeckStatus::Occupied.into()),
+        ]);
         let collapsed_groups = BTreeSet::new();
         let view = DashboardView::build_with_statuses(
-            &[running],
+            &[running, thinking, occupied],
             &statuses,
             &collapsed_groups,
             "",
@@ -5189,6 +5887,8 @@ mod tests {
 
         let counts = group_status_counts(&view.groups[0]);
         assert_eq!(counts.running, 0);
+        assert_eq!(counts.occupied, 1);
+        assert_eq!(counts.thinking, 1);
         assert_eq!(counts.waiting, 1);
     }
 
@@ -5250,6 +5950,7 @@ mod tests {
             sessions: vec![record("1", "ops", "deploy", false)],
             collapsed_groups: BTreeSet::new(),
             group_default_paths: BTreeMap::new(),
+            group_defaults: BTreeMap::new(),
             deck_statuses: BTreeMap::new(),
             details: TuiDetails::default(),
             details_session_id: None,
@@ -5533,6 +6234,7 @@ mod tests {
             worktree: true,
             carry_state: true,
             field_index: 0,
+            launching: false,
         };
 
         let request = form.build_request().unwrap();
@@ -5551,6 +6253,65 @@ mod tests {
         assert!(request.carry_state);
         assert!(!request.sandbox);
         assert_eq!(request.prompt, None);
+    }
+
+    #[test]
+    fn new_form_uses_group_defaults() {
+        let mut group = group_record("ops", "/tmp/ops", false);
+        group.default_agent = Some("codex".to_string());
+        group.default_worktree = Some(true);
+        group.default_carry_state = Some(true);
+        let app = app_from_initial(TuiInitialState {
+            sessions: Vec::new(),
+            groups: vec![group],
+            default_agent: "shell".to_string(),
+            headroom_metrics: None,
+            agent_choices: default_agent_choices(),
+            tool_settings: normalize_tool_settings(Vec::new()),
+        });
+
+        let form = new_form_for_agent(&app, "shell");
+
+        assert_eq!(form.group_name, "ops");
+        assert_eq!(form.path, "/tmp/ops");
+        assert_eq!(form.agent, "codex");
+        assert!(form.worktree);
+        assert!(form.carry_state);
+    }
+
+    #[test]
+    fn new_session_form_defaults_to_selected_session_group() {
+        let mut beta_group = group_record("beta", "/tmp/beta", false);
+        beta_group.default_agent = Some("codex".to_string());
+        beta_group.default_worktree = Some(true);
+        let mut app = app_from_initial(TuiInitialState {
+            sessions: vec![
+                record("1", "alpha", "build", false),
+                record("2", "beta", "deploy", false),
+            ],
+            groups: vec![group_record("alpha", "/tmp/alpha", false), beta_group],
+            default_agent: "shell".to_string(),
+            headroom_metrics: None,
+            agent_choices: default_agent_choices(),
+            tool_settings: normalize_tool_settings(Vec::new()),
+        });
+        app.selected_index = 1;
+        let mut handle = |_action| Ok(Vec::new());
+
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut app,
+            &mut handle,
+        )
+        .unwrap();
+
+        let Mode::New(form) = &app.mode else {
+            panic!("expected new form");
+        };
+        assert_eq!(form.group_name, "beta");
+        assert_eq!(form.path, "/tmp/beta");
+        assert_eq!(form.agent, "codex");
+        assert!(form.worktree);
     }
 
     #[test]
@@ -5870,8 +6631,36 @@ mod tests {
 
         assert_eq!(
             footer_text(&app),
-            "Enter session m move r restart f fork d delete D cleanup | n new Ctrl-n shell N duplicate | g tools | Ctrl-t mouse/select | j/k nav c/e groups Pg scroll / search t status ? help q quit"
+            "Enter session r rename m move f fork d delete D cleanup | n new Ctrl-n shell N duplicate | G new group E edit group | g tools | Ctrl-t mouse/select | j/k nav c/e groups Pg scroll / search t status ? help q quit"
         );
+    }
+
+    #[test]
+    fn r_key_opens_rename_without_action() {
+        let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
+        let mut calls = 0;
+        let mut handle = |_action| {
+            calls += 1;
+            Ok(Vec::new())
+        };
+
+        let quit = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            &mut app,
+            &mut handle,
+        )
+        .unwrap();
+
+        assert!(!quit);
+        assert_eq!(calls, 0);
+        assert_eq!(
+            app.mode,
+            Mode::Rename(RenameForm {
+                session_id: "1".to_string(),
+                name: "deploy".to_string(),
+            })
+        );
+        assert_eq!(app.status_message, None);
     }
 
     #[test]
@@ -5970,6 +6759,37 @@ mod tests {
     }
 
     #[test]
+    fn normal_mode_ctrl_q_does_not_quit() {
+        let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
+        let mut handle = |_action| Ok(Vec::new());
+
+        let quit = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            &mut app,
+            &mut handle,
+        )
+        .unwrap();
+
+        assert!(!quit);
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn normal_mode_plain_q_quits() {
+        let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
+        let mut handle = |_action| Ok(Vec::new());
+
+        let quit = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            &mut app,
+            &mut handle,
+        )
+        .unwrap();
+
+        assert!(quit);
+    }
+
+    #[test]
     fn status_filter_key_cycles_and_resets_selection() {
         let mut stopped = record("2", "ops", "logs", false);
         stopped.status = SessionStatus::Stopped;
@@ -5988,9 +6808,25 @@ mod tests {
             &mut handle,
         )
         .unwrap();
-        assert_eq!(app.status_filter, StatusFilter::Running);
+        assert_eq!(app.status_filter, StatusFilter::Occupied);
         assert_eq!(app.selected_index, 0);
         assert_eq!(app.detail_scroll, 0);
+
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+            &mut app,
+            &mut handle,
+        )
+        .unwrap();
+        assert_eq!(app.status_filter, StatusFilter::Thinking);
+
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+            &mut app,
+            &mut handle,
+        )
+        .unwrap();
+        assert_eq!(app.status_filter, StatusFilter::Running);
 
         handle_normal_key(
             KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
@@ -6041,6 +6877,49 @@ mod tests {
         assert_eq!(action, Some(("ops".to_string(), true)));
         assert!(app.collapsed_groups.contains("ops"));
         assert_eq!(app.status_message.as_deref(), Some("collapsed group ops"));
+    }
+
+    #[test]
+    fn group_settings_saves_overrides() {
+        let session = record("1", "ops", "deploy", false);
+        let group = group_record("ops", "/tmp/ops", false);
+        let mut app = app_from_initial(TuiInitialState {
+            sessions: vec![session],
+            groups: vec![group],
+            default_agent: "shell".to_string(),
+            headroom_metrics: None,
+            agent_choices: default_agent_choices(),
+            tool_settings: normalize_tool_settings(Vec::new()),
+        });
+        open_group_settings(&mut app);
+        let Mode::GroupSettings(form) = &mut app.mode else {
+            panic!("expected group settings form");
+        };
+        form.default_agent = "codex".to_string();
+        form.default_worktree = Some(true);
+        form.default_carry_state = Some(true);
+
+        let refreshed = app.sessions.clone();
+        let mut saved = None;
+        let mut handle = |action| {
+            if let TuiAction::UpdateGroup { name, update } = action {
+                saved = Some((name, update));
+            }
+            Ok(refreshed.clone())
+        };
+        handle_group_settings_key(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &mut app,
+            &mut handle,
+        )
+        .unwrap();
+
+        let (name, update) = saved.expect("group update saved");
+        assert_eq!(name, "ops");
+        assert_eq!(update.default_agent, Some(Some("codex".to_string())));
+        assert_eq!(update.default_worktree, Some(Some(true)));
+        assert_eq!(update.default_carry_state, Some(Some(true)));
+        assert_eq!(app.status_message.as_deref(), Some("updated group ops"));
     }
 
     #[test]
@@ -6153,6 +7032,23 @@ mod tests {
     }
 
     #[test]
+    fn rename_key_prefills_selected_session_name() {
+        let mut app = test_app(vec![record("1", "work/api", "deploy", false)]);
+        let mut handle = |_action| Ok(Vec::new());
+        handle_normal_key(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            &mut app,
+            &mut handle,
+        )
+        .unwrap();
+        let Mode::Rename(form) = app.mode else {
+            panic!("expected rename form");
+        };
+        assert_eq!(form.session_id, "1");
+        assert_eq!(form.name, "deploy");
+    }
+
+    #[test]
     fn move_form_submits_group_change_and_preserves_selection() {
         let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
         app.group_default_paths
@@ -6190,6 +7086,60 @@ mod tests {
         assert_eq!(selected.id, "1");
         assert_eq!(selected.group_name, "core");
         assert_eq!(app.status_message.as_deref(), Some("moved session"));
+    }
+
+    #[test]
+    fn rename_form_submits_name_change_and_preserves_selection() {
+        let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
+        app.mode = Mode::Rename(RenameForm {
+            session_id: "1".to_string(),
+            name: "release".to_string(),
+        });
+        let refreshed = vec![
+            record("2", "ops", "other", false),
+            record("1", "ops", "release", false),
+        ];
+        let mut renamed = None;
+        let mut handle = |action| {
+            if let TuiAction::RenameSession { session_id, name } = action {
+                renamed = Some((session_id, name));
+            }
+            Ok(refreshed.clone())
+        };
+
+        handle_rename_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            &mut handle,
+        )
+        .unwrap();
+
+        let selected = app.view().selected.unwrap();
+        assert_eq!(renamed, Some(("1".to_string(), "release".to_string())));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(selected.id, "1");
+        assert_eq!(selected.name, "release");
+        assert_eq!(app.status_message.as_deref(), Some("renamed session"));
+    }
+
+    #[test]
+    fn rename_form_rejects_empty_name() {
+        let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
+        app.mode = Mode::Rename(RenameForm {
+            session_id: "1".to_string(),
+            name: "   ".to_string(),
+        });
+        let mut handle = |_action| Ok(Vec::new());
+
+        handle_rename_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            &mut handle,
+        )
+        .unwrap();
+
+        assert!(matches!(app.mode, Mode::Rename(_)));
+        assert_eq!(app.status_message.as_deref(), Some("name required"));
     }
 
     #[test]
@@ -6271,20 +7221,20 @@ mod tests {
 
         selected.updated_at = 3;
         let refreshed = vec![older, selected];
-        let mut restarted = None;
+        let mut stopped = None;
         let mut handle = |action| {
-            if let TuiAction::Restart(id) = action {
-                restarted = Some(id);
+            if let TuiAction::Stop(id) = action {
+                stopped = Some(id);
             }
             Ok(refreshed.clone())
         };
 
-        run_selected_action(&mut app, &mut handle, TuiAction::Restart, "restarted").unwrap();
+        run_selected_action(&mut app, &mut handle, TuiAction::Stop, "stopped").unwrap();
 
-        assert_eq!(restarted.as_deref(), Some("2"));
+        assert_eq!(stopped.as_deref(), Some("2"));
         assert_eq!(app.view().selected.unwrap().id, "2");
         assert_eq!(app.detail_scroll, 0);
-        assert_eq!(app.status_message.as_deref(), Some("restarted"));
+        assert_eq!(app.status_message.as_deref(), Some("stopped"));
     }
 
     #[test]
@@ -6354,29 +7304,6 @@ mod tests {
         assert!(refreshed_once);
         assert_eq!(selected.id, "1");
         assert_eq!(selected.status, SessionStatus::Stopped);
-    }
-
-    #[test]
-    fn normal_restart_key_runs_selected_action() {
-        let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
-        let refreshed = app.sessions.clone();
-        let mut actions = Vec::new();
-        let mut handle = |action| {
-            match action {
-                TuiAction::Restart(id) => actions.push(format!("restart:{id}")),
-                _ => actions.push("other".to_string()),
-            }
-            Ok(refreshed.clone())
-        };
-
-        handle_normal_key(
-            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
-            &mut app,
-            &mut handle,
-        )
-        .unwrap();
-
-        assert_eq!(actions, vec!["restart:1"]);
     }
 
     #[test]
@@ -6534,14 +7461,30 @@ mod tests {
     }
 
     #[test]
-    fn focused_session_defaults_to_text_selection() {
+    fn focused_session_defaults_to_mouse_scrolling() {
         let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
+
+        focus_selected_session(&mut app);
+
+        assert!(matches!(app.mode, Mode::Session(_)));
+        assert!(app.mouse_capture);
+        assert!(wants_mouse_capture(&app));
+    }
+
+    #[test]
+    fn focused_session_preserves_text_selection_mode() {
+        let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
+        app.mouse_capture = false;
 
         focus_selected_session(&mut app);
 
         assert!(matches!(app.mode, Mode::Session(_)));
         assert!(!app.mouse_capture);
         assert!(!wants_mouse_capture(&app));
+        assert_eq!(
+            footer_text(&app),
+            "Session: text selection mode | Ctrl-q dashboard | Ctrl-t wheel scroll"
+        );
     }
 
     #[test]
@@ -6610,6 +7553,38 @@ mod tests {
         .unwrap();
         let cursor = terminal.backend().cursor_position();
         assert_eq!((cursor.x, cursor.y), expected_cursor);
+    }
+
+    #[test]
+    fn new_session_submit_draws_launching_feedback() {
+        let backend = ratatui::backend::TestBackend::new(100, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = test_app(vec![]);
+        app.mode = Mode::New(NewForm {
+            name: "deploy".to_string(),
+            path: "/tmp/project".to_string(),
+            group_name: "ops".to_string(),
+            field_index: NEW_FIELDS.len() - 1,
+            ..NewForm::default()
+        });
+        let refreshed = vec![record("1", "ops", "deploy", false)];
+        let mut handle = |action| {
+            assert!(matches!(action, TuiAction::Create(_)));
+            Ok(refreshed.clone())
+        };
+
+        process_key(
+            &mut terminal,
+            &mut app,
+            &mut handle,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("Launching session..."));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.status_message.as_deref(), Some("created session"));
     }
 
     #[test]
@@ -6894,6 +7869,15 @@ mod tests {
     }
 
     #[test]
+    fn embedded_key_encodes_shift_tab_for_tmux() {
+        assert_eq!(
+            encode_embedded_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), false)
+                .as_deref(),
+            Some(&b"\x1b[Z"[..])
+        );
+    }
+
+    #[test]
     fn terminal_preview_smoke_test() {
         if std::env::var_os("AGENT_HELM_TMUX_SMOKE").is_none() {
             return;
@@ -6990,13 +7974,88 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
+        let row = text
+            .lines()
+            .find(|line| line.contains("`-") && line.contains("deploy"))
+            .expect("session row");
 
-        assert!(text.contains("running using Bash"));
+        assert!(row.contains("◐"));
+        assert!(row.contains("using Bash"));
+        assert!(!row.contains("running"));
     }
 
     #[test]
-    fn session_activity_marker_animates_running_sessions() {
+    fn session_list_suppresses_redundant_agent_activity_label() {
+        let backend = ratatui::backend::TestBackend::new(200, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut session = record("1", "ops", "deploy", false);
+        session.agent = "codex".to_string();
+        let mut app = test_app(vec![session]);
+        app.deck_statuses.insert(
+            "1".to_string(),
+            TuiSessionStatus {
+                deck_status: SessionDeckStatus::Running,
+                activity: Some(SessionActivity {
+                    state: "working".to_string(),
+                    label: "using codex".to_string(),
+                    source: "codex_transcript".to_string(),
+                    tool: Some("codex".to_string()),
+                }),
+            },
+        );
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        let row = text
+            .lines()
+            .find(|line| line.contains("`-") && line.contains("deploy"))
+            .expect("session row");
+
+        assert!(row.contains("codex"));
+        assert!(row.contains("◐"));
+        assert!(!row.contains("running"));
+        assert!(!row.contains("using codex"));
+    }
+
+    #[test]
+    fn session_list_does_not_animate_runtime_start_activity() {
+        let mut session = SessionSummary::from(&record("1", "ops", "deploy", false));
+        session.activity = Some(SessionActivity {
+            state: "running".to_string(),
+            label: "using codex".to_string(),
+            source: "runtime_start".to_string(),
+            tool: Some("codex".to_string()),
+        });
+
+        assert_eq!(session_activity_marker(&session, 0), "●");
+        assert_eq!(session_activity_marker(&session, 1), "●");
+        assert_eq!(session_activity_marker(&session, 2), "●");
+        assert_eq!(session_activity_label(&session), None);
+    }
+
+    #[test]
+    fn session_activity_marker_uses_unicode_status_indicators() {
         let running = SessionSummary::from(&record("1", "ops", "deploy", false));
+        let activity = SessionActivity {
+            state: "working".to_string(),
+            label: "using Bash".to_string(),
+            source: "claude_transcript".to_string(),
+            tool: Some("Bash".to_string()),
+        };
+        let mut active = running.clone();
+        active.activity = Some(activity.clone());
+        let mut occupied = running.clone();
+        occupied.deck_status = SessionDeckStatus::Occupied;
+        let mut active_occupied = occupied.clone();
+        active_occupied.activity = Some(activity.clone());
+        let mut thinking = running.clone();
+        thinking.deck_status = SessionDeckStatus::Thinking;
+        let mut active_thinking = thinking.clone();
+        active_thinking.activity = Some(activity.clone());
+        let mut starting = running.clone();
+        starting.deck_status = SessionDeckStatus::Starting;
+        let mut active_starting = starting.clone();
+        active_starting.activity = Some(activity);
         let mut stopped_record = record("2", "ops", "done", false);
         stopped_record.status = SessionStatus::Stopped;
         let stopped = SessionSummary::from(&stopped_record);
@@ -7006,16 +8065,60 @@ mod tests {
         queued.deck_status = SessionDeckStatus::Queued;
         let mut idle = running.clone();
         idle.deck_status = SessionDeckStatus::Idle;
+        let mut errored = running.clone();
+        errored.deck_status = SessionDeckStatus::Errored;
 
-        assert_ne!(
-            session_activity_marker(&running, 0),
-            session_activity_marker(&running, 2)
+        assert_eq!(session_activity_marker(&occupied, 0), "◆");
+        assert_eq!(session_activity_marker(&active_occupied, 0), "◆");
+        assert_eq!(session_activity_marker(&active_occupied, 1), "◇");
+        assert_eq!(session_activity_marker(&thinking, 0), "✦");
+        assert_eq!(session_activity_marker(&active_thinking, 0), "✦");
+        assert_eq!(session_activity_marker(&active_thinking, 1), "✧");
+        assert_eq!(session_activity_marker(&running, 0), "●");
+        assert_eq!(session_activity_marker(&running, 2), "●");
+        assert_eq!(session_activity_marker(&active, 0), "◐");
+        assert_eq!(session_activity_marker(&active, 2), "◑");
+        assert_eq!(session_activity_marker(&starting, 0), "▸");
+        assert_eq!(session_activity_marker(&active_starting, 0), "▸");
+        assert_eq!(session_activity_marker(&active_starting, 1), "▹");
+        assert_eq!(session_activity_marker(&queued, 0), "⋯");
+        assert_eq!(session_activity_marker(&waiting, 0), "◌");
+        assert_eq!(session_activity_marker(&idle, 0), "·");
+        assert_eq!(session_activity_marker(&stopped, 0), "■");
+        assert_eq!(session_activity_marker(&stopped, 2), "■");
+        assert_eq!(session_activity_marker(&errored, 0), "×");
+    }
+
+    #[test]
+    fn session_row_uses_marker_instead_of_status_word() {
+        let sessions = vec![record("1", "ops", "deploy", false)];
+        let view = DashboardView::build_with_statuses(
+            &sessions,
+            &BTreeMap::from([("1".to_string(), SessionDeckStatus::Thinking.into())]),
+            &BTreeSet::new(),
+            "",
+            0,
+            StatusFilter::All,
         );
-        assert_eq!(session_activity_marker(&queued, 0), ":");
-        assert_eq!(session_activity_marker(&waiting, 0), "?");
-        assert_eq!(session_activity_marker(&idle, 0), "-");
-        assert_eq!(session_activity_marker(&stopped, 0), "o");
-        assert_eq!(session_activity_marker(&stopped, 2), "o");
+        let backend = ratatui::backend::TestBackend::new(80, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                let (list, mut state) = session_list(&view, 0);
+                frame.render_stateful_widget(list, frame.area(), &mut state);
+            })
+            .unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        let row = text
+            .lines()
+            .find(|line| line.contains("`-") && line.contains("deploy"))
+            .expect("session row");
+
+        assert!(row.contains("✦"));
+        assert!(!row.contains("thinking"));
+        assert!(!row.contains("occupied"));
+        assert!(!row.contains("idle"));
     }
 
     #[test]
@@ -7405,6 +8508,7 @@ mod tests {
             sessions,
             collapsed_groups: BTreeSet::new(),
             group_default_paths: BTreeMap::new(),
+            group_defaults: BTreeMap::new(),
             deck_statuses: BTreeMap::from([("1".to_string(), SessionDeckStatus::Waiting.into())]),
             details: TuiDetails {
                 deck_status: SessionDeckStatus::Waiting,
@@ -7468,6 +8572,9 @@ mod tests {
             profile: "default".to_string(),
             name: name.to_string(),
             default_project_path: default_project_path.to_string(),
+            default_agent: None,
+            default_worktree: None,
+            default_carry_state: None,
             collapsed,
             display_order: 0,
             metadata: "{}".to_string(),

@@ -2,10 +2,10 @@ use crate::{
     error::{AppError, Result},
     models::{
         AttachmentStatus, ConductorAssignmentRecord, ConductorRecord, ConductorStatus, CostEvent,
-        CostFilter, CostSummary, GroupRecord, McpAttachmentRecord, ProjectRecord,
-        ProjectTrustState, SessionEvent, SessionRecord, SessionStatus, SkillAttachmentRecord,
-        WatcherEventRecord, WatcherRecord, WatcherStatus, WorkspaceRecord, WorktreeRecord,
-        WorktreeStatus, now_ts,
+        CostFilter, CostSummary, GroupRecord, GroupSettingsUpdate, McpAttachmentRecord,
+        ProjectRecord, ProjectTrustState, SessionEvent, SessionRecord, SessionStatus,
+        SkillAttachmentRecord, WatcherEventRecord, WatcherRecord, WatcherStatus, WorkspaceRecord,
+        WorktreeRecord, WorktreeStatus, now_ts,
     },
     security::{redact_event_payload, redact_json_value},
 };
@@ -392,22 +392,26 @@ impl SessionStore {
         &self,
         profile: &str,
         name: &str,
-        default_project_path: Option<&str>,
-        collapsed: Option<bool>,
+        update: &GroupSettingsUpdate,
     ) -> Result<GroupRecord> {
         self.with_transaction(|tx| {
             let group = Self::get_group_in(tx, profile, name)?;
+            let metadata = updated_group_metadata(&group.metadata, update);
             let changed = tx.execute(
                 r#"
                 UPDATE groups
-                SET default_project_path = ?3, collapsed = ?4, version = version + 1, updated_at = ?5
-                WHERE profile = ?1 AND name = ?2 AND version = ?6
+                SET default_project_path = ?3, collapsed = ?4, metadata = ?5, version = version + 1, updated_at = ?6
+                WHERE profile = ?1 AND name = ?2 AND version = ?7
                 "#,
                 params![
                     profile,
                     name,
-                    default_project_path.unwrap_or(&group.default_project_path),
-                    bool_to_int(collapsed.unwrap_or(group.collapsed)),
+                    update
+                        .default_project_path
+                        .as_deref()
+                        .unwrap_or(&group.default_project_path),
+                    bool_to_int(update.collapsed.unwrap_or(group.collapsed)),
+                    metadata,
                     now_ts(),
                     group.version,
                 ],
@@ -484,6 +488,26 @@ impl SessionStore {
                 WHERE id = ?1 AND version = ?2
                 "#,
                 params![id, expected_version, group_name, now_ts()],
+            )?;
+            ensure_changed(changed, "session version conflict", id)?;
+            Self::get_session_in(tx, id)
+        })
+    }
+
+    pub fn update_session_name(
+        &self,
+        id: &str,
+        expected_version: i64,
+        name: &str,
+    ) -> Result<SessionRecord> {
+        self.with_transaction(|tx| {
+            let changed = tx.execute(
+                r#"
+                UPDATE sessions
+                SET name = ?3, version = version + 1, updated_at = ?4
+                WHERE id = ?1 AND version = ?2
+                "#,
+                params![id, expected_version, name, now_ts()],
             )?;
             ensure_changed(changed, "session version conflict", id)?;
             Self::get_session_in(tx, id)
@@ -1797,11 +1821,15 @@ impl SessionStore {
     fn read_group(row: &Row<'_>) -> rusqlite::Result<GroupRecord> {
         let collapsed: i64 = row.get("collapsed")?;
         let metadata: String = row.get("metadata")?;
+        let metadata_value = group_metadata_value(&metadata);
         Ok(GroupRecord {
             id: row.get("id")?,
             profile: row.get("profile")?,
             name: row.get("name")?,
             default_project_path: row.get("default_project_path")?,
+            default_agent: group_metadata_string(&metadata_value, "default_agent"),
+            default_worktree: group_metadata_bool(&metadata_value, "default_worktree"),
+            default_carry_state: group_metadata_bool(&metadata_value, "default_carry_state"),
             collapsed: collapsed != 0,
             display_order: row.get("display_order")?,
             metadata: if metadata.trim().is_empty() || metadata.trim() == "{}" {
@@ -2010,6 +2038,71 @@ fn group_metadata(name: &str) -> String {
         "depth": depth,
     })
     .to_string()
+}
+
+fn group_metadata_value(metadata: &str) -> Value {
+    serde_json::from_str(metadata).unwrap_or_else(|_| json!({}))
+}
+
+fn group_metadata_string(metadata: &Value, key: &str) -> Option<String> {
+    metadata
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn group_metadata_bool(metadata: &Value, key: &str) -> Option<bool> {
+    metadata.get(key).and_then(Value::as_bool)
+}
+
+fn updated_group_metadata(metadata: &str, update: &GroupSettingsUpdate) -> String {
+    let mut value = group_metadata_value(metadata);
+    apply_metadata_string_override(&mut value, "default_agent", &update.default_agent);
+    apply_metadata_bool_override(&mut value, "default_worktree", &update.default_worktree);
+    apply_metadata_bool_override(
+        &mut value,
+        "default_carry_state",
+        &update.default_carry_state,
+    );
+    value.to_string()
+}
+
+fn apply_metadata_string_override(value: &mut Value, key: &str, update: &Option<Option<String>>) {
+    let Some(update) = update else {
+        return;
+    };
+    if !value.is_object() {
+        *value = json!({});
+    }
+    let object = value.as_object_mut().expect("metadata object");
+    match update {
+        Some(next) if !next.trim().is_empty() => {
+            object.insert(key.to_string(), json!(next.trim()));
+        }
+        _ => {
+            object.remove(key);
+        }
+    }
+}
+
+fn apply_metadata_bool_override(value: &mut Value, key: &str, update: &Option<Option<bool>>) {
+    let Some(update) = update else {
+        return;
+    };
+    if !value.is_object() {
+        *value = json!({});
+    }
+    let object = value.as_object_mut().expect("metadata object");
+    match update {
+        Some(next) => {
+            object.insert(key.to_string(), json!(next));
+        }
+        None => {
+            object.remove(key);
+        }
+    }
 }
 
 fn lock_path(db_path: &Path) -> PathBuf {

@@ -6,6 +6,7 @@ use crate::{
         SessionRecord, SessionStatus, SkillAttachmentRecord, StructuredEvent,
     },
 };
+use serde_json::{Value, json};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentCapabilities {
@@ -28,6 +29,18 @@ pub struct AgentForkPlan {
 pub struct AdapterMaterializationPlan {
     pub json: String,
     pub restart_required: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TranscriptEntry {
+    pub line: i64,
+    pub value: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct TranscriptAgentState {
+    pub line: i64,
+    pub payload: Value,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -158,31 +171,35 @@ impl AgentRegistry {
         &self,
         agent: &str,
         lifecycle_status: SessionStatus,
+        transcript_state: Option<&Value>,
         recent_events: &[SessionEvent],
         open_assignments: &[ConductorAssignmentRecord],
     ) -> Result<SessionDeckStatusDerivation> {
-        let _ = self.adapter(agent)?;
+        let adapter = self.adapter(agent)?;
         let deck_status = match lifecycle_status {
             SessionStatus::Starting => SessionDeckStatus::Starting,
             SessionStatus::Stopped => SessionDeckStatus::Stopped,
             SessionStatus::Errored => SessionDeckStatus::Errored,
             SessionStatus::Running => {
-                if open_assignments
-                    .iter()
-                    .any(|assignment| assignment_status_is(&assignment.status, "queued"))
-                {
+                if let Some((status, activity)) = transcript_state.and_then(activity_from_payload) {
                     return Ok(SessionDeckStatusDerivation {
-                        deck_status: SessionDeckStatus::Queued,
+                        deck_status: status,
                         source_event_id: None,
-                        source: "conductor_assignment".to_string(),
-                        activity: Some(static_activity("queued", "queued", "conductor_assignment")),
+                        source: "transcript".to_string(),
+                        activity: Some(activity),
                     });
                 }
                 let has_assigned_assignment = open_assignments
                     .iter()
                     .any(|assignment| assignment_status_is(&assignment.status, "assigned"));
+                let has_open_assignment = has_assigned_assignment
+                    || open_assignments
+                        .iter()
+                        .any(|assignment| assignment_status_is(&assignment.status, "queued"));
                 for event in recent_events {
-                    if has_assigned_assignment && is_runtime_lifecycle_agent_state(event) {
+                    if is_wrapper_lifecycle_agent_state(event)
+                        || (has_open_assignment && is_runtime_lifecycle_agent_state(event))
+                    {
                         continue;
                     }
                     if let Some((status, activity)) = activity_from_event(event) {
@@ -202,6 +219,17 @@ impl AgentRegistry {
                         });
                     }
                 }
+                if open_assignments
+                    .iter()
+                    .any(|assignment| assignment_status_is(&assignment.status, "queued"))
+                {
+                    return Ok(SessionDeckStatusDerivation {
+                        deck_status: SessionDeckStatus::Queued,
+                        source_event_id: None,
+                        source: "conductor_assignment".to_string(),
+                        activity: Some(static_activity("queued", "queued", "conductor_assignment")),
+                    });
+                }
                 if has_assigned_assignment {
                     return Ok(SessionDeckStatusDerivation {
                         deck_status: SessionDeckStatus::Waiting,
@@ -212,6 +240,14 @@ impl AgentRegistry {
                             "assigned",
                             "conductor_assignment",
                         )),
+                    });
+                }
+                if matches!(adapter.id, "claude" | "codex") {
+                    return Ok(SessionDeckStatusDerivation {
+                        deck_status: SessionDeckStatus::Idle,
+                        source_event_id: None,
+                        source: "ai_lifecycle".to_string(),
+                        activity: Some(static_activity("idle", "ready", "ai_lifecycle")),
                     });
                 }
                 SessionDeckStatus::Running
@@ -302,6 +338,19 @@ impl AgentRegistry {
         })
     }
 
+    pub fn derive_transcript_agent_state(
+        &self,
+        agent: &str,
+        entries: &[TranscriptEntry],
+    ) -> Result<Option<TranscriptAgentState>> {
+        let adapter = self.adapter(agent)?;
+        Ok(match adapter.id {
+            "claude" => claude_transcript_agent_state(entries),
+            "codex" => codex_transcript_agent_state(entries),
+            _ => None,
+        })
+    }
+
     fn adapter(&self, agent: &str) -> Result<&'static AgentAdapter> {
         if let Some(adapter) = ADAPTERS.iter().find(|adapter| adapter.id == agent) {
             return Ok(adapter);
@@ -313,39 +362,433 @@ impl AgentRegistry {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ActiveTranscriptCall {
+    key: String,
+    tool: Option<String>,
+}
+
+fn codex_transcript_agent_state(entries: &[TranscriptEntry]) -> Option<TranscriptAgentState> {
+    let mut active_calls = Vec::new();
+    let mut state = None;
+    let mut line = None;
+    let mut event = None;
+    let mut tool = None;
+    let mut call_id = None;
+
+    for entry in entries {
+        let payload = codex_event_payload(&entry.value);
+        let Some(event_type) =
+            json_string(payload, "type").or_else(|| json_string(&entry.value, "type"))
+        else {
+            continue;
+        };
+
+        if codex_call_starts(event_type) {
+            let key = transcript_call_key(payload, event_type, entry.line);
+            let next_tool = codex_tool_name(payload);
+            upsert_active_call(&mut active_calls, key.clone(), next_tool.clone());
+            state = Some("occupied");
+            line = Some(entry.line);
+            event = Some(event_type.to_string());
+            tool = next_tool;
+            call_id = json_string(payload, "call_id").map(str::to_string);
+            continue;
+        }
+
+        if codex_call_ends(event_type) {
+            let removed_tool =
+                remove_active_call(&mut active_calls, payload).or_else(|| codex_tool_name(payload));
+            state = Some(if active_calls.is_empty() {
+                "thinking"
+            } else {
+                "occupied"
+            });
+            line = Some(entry.line);
+            event = Some(event_type.to_string());
+            tool = active_calls
+                .last()
+                .and_then(|call| call.tool.clone())
+                .or(removed_tool);
+            call_id = json_string(payload, "call_id").map(str::to_string);
+            continue;
+        }
+
+        if codex_reasoning_event(event_type) {
+            state = Some(if active_calls.is_empty() {
+                "thinking"
+            } else {
+                "occupied"
+            });
+            line = Some(entry.line);
+            event = Some(event_type.to_string());
+            tool = active_calls.last().and_then(|call| call.tool.clone());
+            call_id = json_string(payload, "call_id").map(str::to_string);
+            continue;
+        }
+
+        if codex_idle_event(event_type) {
+            active_calls.clear();
+            state = Some("idle");
+            line = Some(entry.line);
+            event = Some(event_type.to_string());
+            tool = None;
+            call_id = None;
+        }
+    }
+
+    if let Some(active_call) = active_calls.last() {
+        state = Some("occupied");
+        tool = active_call.tool.clone();
+        if call_id.is_none() {
+            call_id = Some(active_call.key.clone());
+        }
+    }
+
+    let state = state?;
+    let mut payload = serde_json::Map::from_iter([
+        ("state".to_string(), json!(state)),
+        ("source".to_string(), json!("codex_transcript")),
+    ]);
+    if let Some(event) = event {
+        payload.insert("transcript_event".to_string(), json!(event));
+    }
+    if let Some(tool) = tool {
+        payload.insert("tool".to_string(), json!({ "name": tool }));
+    }
+    if let Some(call_id) = call_id {
+        payload.insert("call_id".to_string(), json!(call_id));
+    }
+    if !active_calls.is_empty() {
+        payload.insert("active_call_count".to_string(), json!(active_calls.len()));
+    }
+
+    Some(TranscriptAgentState {
+        line: line.unwrap_or_else(|| entries.last().map(|entry| entry.line).unwrap_or_default()),
+        payload: Value::Object(payload),
+    })
+}
+
+fn claude_transcript_agent_state(entries: &[TranscriptEntry]) -> Option<TranscriptAgentState> {
+    let mut active_calls = Vec::new();
+    let mut state = None;
+    let mut line = None;
+    let mut tool = None;
+
+    for entry in entries {
+        let value = &entry.value;
+        let role = claude_role(value).unwrap_or("");
+        let content = claude_message_content(value).or_else(|| value.get("content"));
+        let tool_uses = content.map(claude_tool_use_blocks).unwrap_or_default();
+        let tool_results = content.map(claude_tool_result_blocks).unwrap_or_default();
+        let has_thinking = content.is_some_and(claude_content_has_thinking);
+
+        if !tool_uses.is_empty() {
+            for tool_use in tool_uses {
+                let key = claude_tool_use_key(tool_use, entry.line);
+                let next_tool = json_string(tool_use, "name")
+                    .and_then(non_empty_string)
+                    .or_else(|| Some("tool".to_string()));
+                upsert_active_call(&mut active_calls, key, next_tool.clone());
+                tool = next_tool;
+            }
+            state = Some("occupied");
+            line = Some(entry.line);
+            continue;
+        }
+
+        if !tool_results.is_empty() {
+            for tool_result in tool_results {
+                tool = remove_active_call(&mut active_calls, tool_result);
+            }
+            state = Some(if active_calls.is_empty() {
+                "thinking"
+            } else {
+                "occupied"
+            });
+            line = Some(entry.line);
+            if state == Some("occupied") {
+                tool = active_calls.last().and_then(|call| call.tool.clone());
+            }
+            continue;
+        }
+
+        if has_thinking || claude_assistant_is_incomplete(value) {
+            state = Some(if active_calls.is_empty() {
+                "thinking"
+            } else {
+                "occupied"
+            });
+            line = Some(entry.line);
+            tool = active_calls.last().and_then(|call| call.tool.clone());
+            continue;
+        }
+
+        if role.eq_ignore_ascii_case("assistant") && active_calls.is_empty() {
+            state = Some("idle");
+            line = Some(entry.line);
+            tool = None;
+        }
+    }
+
+    if let Some(active_call) = active_calls.last() {
+        state = Some("occupied");
+        tool = active_call.tool.clone();
+    }
+
+    let state = state?;
+    let mut payload = serde_json::Map::from_iter([
+        ("state".to_string(), json!(state)),
+        ("source".to_string(), json!("claude_transcript")),
+    ]);
+    if let Some(tool) = tool {
+        payload.insert("tool".to_string(), json!({ "name": tool }));
+    }
+    if !active_calls.is_empty() {
+        payload.insert("active_call_count".to_string(), json!(active_calls.len()));
+    }
+
+    Some(TranscriptAgentState {
+        line: line.unwrap_or_else(|| entries.last().map(|entry| entry.line).unwrap_or_default()),
+        payload: Value::Object(payload),
+    })
+}
+
+fn upsert_active_call(
+    active_calls: &mut Vec<ActiveTranscriptCall>,
+    key: String,
+    tool: Option<String>,
+) {
+    if let Some(call) = active_calls.iter_mut().find(|call| call.key == key) {
+        call.tool = tool;
+        return;
+    }
+    active_calls.push(ActiveTranscriptCall { key, tool });
+}
+
+fn remove_active_call(
+    active_calls: &mut Vec<ActiveTranscriptCall>,
+    payload: &Value,
+) -> Option<String> {
+    let key = json_string(payload, "call_id")
+        .or_else(|| json_string(payload, "tool_use_id"))
+        .or_else(|| json_string(payload, "id"));
+    if let Some(key) = key
+        && let Some(index) = active_calls.iter().position(|call| call.key == key)
+    {
+        return active_calls.remove(index).tool;
+    }
+    active_calls.pop().and_then(|call| call.tool)
+}
+
+fn transcript_call_key(payload: &Value, event_type: &str, line: i64) -> String {
+    json_string(payload, "call_id")
+        .or_else(|| json_string(payload, "tool_use_id"))
+        .or_else(|| json_string(payload, "id"))
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{event_type}:{line}"))
+}
+
+fn codex_call_starts(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "function_call"
+            | "custom_tool_call"
+            | "mcp_tool_call_begin"
+            | "mcp_tool_call_start"
+            | "patch_apply_begin"
+            | "patch_apply_start"
+            | "background_command_start"
+            | "background_command_started"
+            | "background_task_start"
+            | "background_task_started"
+            | "sub_agent_start"
+            | "sub_agent_started"
+            | "subagent_start"
+            | "subagent_started"
+    )
+}
+
+fn codex_call_ends(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "function_call_output"
+            | "custom_tool_call_output"
+            | "mcp_tool_call_end"
+            | "mcp_tool_call_finished"
+            | "patch_apply_end"
+            | "patch_apply_finished"
+            | "background_command_end"
+            | "background_command_finished"
+            | "background_task_end"
+            | "background_task_finished"
+            | "sub_agent_end"
+            | "sub_agent_finished"
+            | "subagent_end"
+            | "subagent_finished"
+    )
+}
+
+fn codex_reasoning_event(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "reasoning" | "agent_reasoning" | "thinking" | "task_started"
+    )
+}
+
+fn codex_idle_event(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "agent_message" | "message" | "task_complete" | "turn_aborted" | "turn_complete"
+    )
+}
+
+fn codex_event_payload(value: &Value) -> &Value {
+    value.get("payload").unwrap_or(value)
+}
+
+fn codex_tool_name(value: &Value) -> Option<String> {
+    json_string(value, "name")
+        .or_else(|| json_string(value, "tool_name"))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
+fn claude_role(value: &Value) -> Option<&str> {
+    value
+        .get("message")
+        .and_then(|message| json_string(message, "role"))
+        .or_else(|| json_string(value, "role"))
+        .or_else(|| json_string(value, "type"))
+}
+
+fn claude_message_content(value: &Value) -> Option<&Value> {
+    value
+        .get("message")
+        .and_then(|message| message.get("content"))
+}
+
+fn claude_tool_use_key(value: &Value, line: i64) -> String {
+    json_string(value, "id")
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("tool_use:{line}"))
+}
+
+fn claude_tool_use_blocks(value: &Value) -> Vec<&Value> {
+    claude_content_blocks(value, "tool_use")
+}
+
+fn claude_tool_result_blocks(value: &Value) -> Vec<&Value> {
+    claude_content_blocks(value, "tool_result")
+}
+
+fn claude_content_blocks<'a>(value: &'a Value, block_type: &str) -> Vec<&'a Value> {
+    let mut blocks = Vec::new();
+    collect_claude_content_blocks(value, block_type, &mut blocks);
+    blocks
+}
+
+fn collect_claude_content_blocks<'a>(
+    value: &'a Value,
+    block_type: &str,
+    blocks: &mut Vec<&'a Value>,
+) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_claude_content_blocks(item, block_type, blocks);
+            }
+        }
+        Value::Object(object) => {
+            if object
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind == block_type)
+            {
+                blocks.push(value);
+            }
+            if let Some(content) = object.get("content") {
+                collect_claude_content_blocks(content, block_type, blocks);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn claude_content_has_thinking(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(claude_content_has_thinking),
+        Value::Object(object) => {
+            object
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| matches!(kind, "thinking" | "reasoning"))
+                || object
+                    .get("content")
+                    .is_some_and(claude_content_has_thinking)
+        }
+        _ => false,
+    }
+}
+
+fn claude_assistant_is_incomplete(value: &Value) -> bool {
+    if !claude_role(value).is_some_and(|role| role.eq_ignore_ascii_case("assistant")) {
+        return false;
+    }
+    value
+        .get("message")
+        .and_then(|message| message.get("stop_reason"))
+        .or_else(|| value.get("stop_reason"))
+        .is_some_and(Value::is_null)
+}
+
+fn json_string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(Value::as_str)
+}
+
 fn activity_from_event(event: &SessionEvent) -> Option<(SessionDeckStatus, SessionActivity)> {
     if event.kind != "agent_state" {
         return None;
     }
-    if let Some(state) = event.payload.get("state").and_then(|value| value.as_str()) {
-        let state = state.trim().to_ascii_lowercase();
-        let deck_status = match state.as_str() {
-            "queued" => SessionDeckStatus::Queued,
-            "waiting" => SessionDeckStatus::Waiting,
-            "running" | "busy" | "working" | "thinking" => SessionDeckStatus::Running,
-            "idle" | "done" | "ready" => SessionDeckStatus::Idle,
-            _ => return None,
-        };
-        let source = event
-            .payload
-            .get("source")
-            .and_then(|value| value.as_str())
-            .unwrap_or("agent_state")
-            .to_string();
-        let tool = agent_state_tool_name(event);
-        let label = agent_state_activity_label(&state, tool.as_deref());
-        return Some((
-            deck_status,
-            SessionActivity {
-                state,
-                label,
-                source,
-                tool,
-            },
-        ));
+    if let Some(activity) = activity_from_payload(&event.payload) {
+        return Some(activity);
     }
 
     gemini_activity_from_event(event)
+}
+
+fn activity_from_payload(payload: &Value) -> Option<(SessionDeckStatus, SessionActivity)> {
+    let state = payload
+        .get("state")
+        .and_then(|value| value.as_str())?
+        .trim()
+        .to_ascii_lowercase();
+    let deck_status = match state.as_str() {
+        "queued" => SessionDeckStatus::Queued,
+        "waiting" => SessionDeckStatus::Waiting,
+        "occupied" => SessionDeckStatus::Occupied,
+        "thinking" => SessionDeckStatus::Thinking,
+        "running" | "busy" | "working" => SessionDeckStatus::Running,
+        "idle" | "done" | "ready" => SessionDeckStatus::Idle,
+        _ => return None,
+    };
+    let source = payload
+        .get("source")
+        .and_then(|value| value.as_str())
+        .unwrap_or("agent_state")
+        .to_string();
+    let tool = agent_state_tool_name(payload);
+    let label = agent_state_activity_label(&state, tool.as_deref());
+    Some((
+        deck_status,
+        SessionActivity {
+            state,
+            label,
+            source,
+            tool,
+        },
+    ))
 }
 
 fn static_activity(state: &str, label: &str, source: &str) -> SessionActivity {
@@ -357,10 +800,10 @@ fn static_activity(state: &str, label: &str, source: &str) -> SessionActivity {
     }
 }
 
-fn agent_state_tool_name(event: &SessionEvent) -> Option<String> {
-    match event.payload.get("tool")? {
-        serde_json::Value::String(name) => non_empty_string(name),
-        serde_json::Value::Object(object) => object
+fn agent_state_tool_name(payload: &Value) -> Option<String> {
+    match payload.get("tool")? {
+        Value::String(name) => non_empty_string(name),
+        Value::Object(object) => object
             .get("name")
             .and_then(|value| value.as_str())
             .and_then(non_empty_string),
@@ -485,10 +928,10 @@ fn non_empty_string(value: &str) -> Option<String> {
 
 fn agent_state_activity_label(state: &str, tool: Option<&str>) -> String {
     match (state, tool) {
-        ("running" | "busy" | "working", Some(tool)) => format!("using {tool}"),
+        ("occupied" | "running" | "busy" | "working", Some(tool)) => format!("using {tool}"),
         ("idle" | "done" | "ready", Some(tool)) => format!("{tool} done"),
         ("thinking", _) => "thinking".to_string(),
-        ("running" | "busy" | "working", _) => "working".to_string(),
+        ("occupied" | "running" | "busy" | "working", _) => "working".to_string(),
         ("idle" | "done" | "ready", _) => "ready".to_string(),
         ("waiting", _) => "waiting".to_string(),
         ("queued", _) => "queued".to_string(),
@@ -523,6 +966,20 @@ fn is_runtime_lifecycle_agent_state(event: &SessionEvent) -> bool {
             source.as_str(),
             "runtime_start" | "runtime_restart" | "runtime_status"
         )
+}
+
+fn is_wrapper_lifecycle_agent_state(event: &SessionEvent) -> bool {
+    if event.kind != "agent_state" {
+        return false;
+    }
+    let source = event
+        .payload
+        .get("source")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    source == "agent_helm_wrapper"
 }
 
 fn shell_quote(value: &str) -> String {
@@ -665,6 +1122,163 @@ mod tests {
         }
     }
 
+    fn transcript_entries(values: Vec<serde_json::Value>) -> Vec<TranscriptEntry> {
+        values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| TranscriptEntry {
+                line: (index + 1) as i64,
+                value,
+            })
+            .collect()
+    }
+
+    fn transcript_state(agent: &str, values: Vec<serde_json::Value>) -> TranscriptAgentState {
+        AgentRegistry
+            .derive_transcript_agent_state(agent, &transcript_entries(values))
+            .unwrap()
+            .expect("transcript state")
+    }
+
+    #[test]
+    fn codex_transcript_state_tracks_reasoning_calls_background_and_idle() {
+        let reasoning = transcript_state(
+            "codex",
+            vec![json!({"type": "response_item", "payload": {"type": "reasoning"}})],
+        );
+        assert_eq!(reasoning.payload["state"], "thinking");
+
+        let active_call = transcript_state(
+            "codex",
+            vec![json!({
+                "type": "response_item",
+                "payload": {"type": "function_call", "call_id": "call-1", "name": "shell"}
+            })],
+        );
+        assert_eq!(active_call.payload["state"], "occupied");
+        assert_eq!(active_call.payload["tool"]["name"], "shell");
+        assert_eq!(active_call.payload["call_id"], "call-1");
+
+        let completed_call = transcript_state(
+            "codex",
+            vec![
+                json!({"type": "response_item", "payload": {"type": "function_call", "call_id": "call-1", "name": "shell"}}),
+                json!({"type": "response_item", "payload": {"type": "function_call_output", "call_id": "call-1"}}),
+            ],
+        );
+        assert_eq!(completed_call.payload["state"], "thinking");
+
+        let multi_call = transcript_state(
+            "codex",
+            vec![
+                json!({"type": "response_item", "payload": {"type": "function_call", "call_id": "call-1", "name": "shell"}}),
+                json!({"type": "response_item", "payload": {"type": "custom_tool_call", "call_id": "call-2", "name": "web_search"}}),
+                json!({"type": "response_item", "payload": {"type": "function_call_output", "call_id": "call-1"}}),
+            ],
+        );
+        assert_eq!(multi_call.payload["state"], "occupied");
+        assert_eq!(multi_call.payload["active_call_count"], 1);
+        assert_eq!(multi_call.payload["tool"]["name"], "web_search");
+
+        let background = transcript_state(
+            "codex",
+            vec![json!({"type": "background_task_started", "id": "bg-1", "name": "sub-agent"})],
+        );
+        assert_eq!(background.payload["state"], "occupied");
+
+        let idle = transcript_state(
+            "codex",
+            vec![
+                json!({"type": "response_item", "payload": {"type": "function_call", "call_id": "call-1", "name": "shell"}}),
+                json!({"type": "response_item", "payload": {"type": "function_call_output", "call_id": "call-1"}}),
+                json!({"type": "response_item", "payload": {"type": "agent_message", "content": "done"}}),
+            ],
+        );
+        assert_eq!(idle.payload["state"], "idle");
+    }
+
+    #[test]
+    fn claude_transcript_state_tracks_reasoning_tools_results_and_idle() {
+        let reasoning = transcript_state(
+            "claude",
+            vec![json!({
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "plan"}]}
+            })],
+        );
+        assert_eq!(reasoning.payload["state"], "thinking");
+
+        let active_tool = transcript_state(
+            "claude",
+            vec![json!({
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "tool-1", "name": "Bash"}]}
+            })],
+        );
+        assert_eq!(active_tool.payload["state"], "occupied");
+        assert_eq!(active_tool.payload["tool"]["name"], "Bash");
+
+        let completed_result = transcript_state(
+            "claude",
+            vec![
+                json!({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "tool-1", "name": "Bash"}]}}),
+                json!({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tool-1", "content": "ok"}]}}),
+            ],
+        );
+        assert_eq!(completed_result.payload["state"], "thinking");
+
+        let multi_tool = transcript_state(
+            "claude",
+            vec![
+                json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tool-1", "name": "Bash"},
+                    {"type": "tool_use", "id": "tool-2", "name": "Read"}
+                ]}}),
+                json!({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tool-1", "content": "ok"}]}}),
+            ],
+        );
+        assert_eq!(multi_tool.payload["state"], "occupied");
+        assert_eq!(multi_tool.payload["active_call_count"], 1);
+        assert_eq!(multi_tool.payload["tool"]["name"], "Read");
+
+        let idle = transcript_state(
+            "claude",
+            vec![
+                json!({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "tool-1", "name": "Bash"}]}}),
+                json!({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tool-1", "content": "ok"}]}}),
+                json!({"type": "assistant", "message": {"role": "assistant", "content": "done"}}),
+            ],
+        );
+        assert_eq!(idle.payload["state"], "idle");
+    }
+
+    #[test]
+    fn transcript_state_precedes_runtime_lifecycle_events() {
+        let registry = AgentRegistry;
+        let transcript = json!({"state": "idle", "source": "codex_transcript"});
+        let events = vec![SessionEvent {
+            id: 9,
+            session_id: "session".into(),
+            kind: "agent_state".into(),
+            payload: json!({"state": "running", "source": "runtime_start"}),
+            created_at: 9,
+        }];
+
+        let derived = registry
+            .derive_deck_status(
+                "codex",
+                SessionStatus::Running,
+                Some(&transcript),
+                &events,
+                &[],
+            )
+            .unwrap();
+
+        assert_eq!(derived.deck_status, SessionDeckStatus::Idle);
+        assert_eq!(derived.source_event_id, None);
+        assert_eq!(derived.source, "transcript");
+    }
+
     #[test]
     fn derive_deck_status_uses_latest_agent_state_event() {
         let registry = AgentRegistry;
@@ -677,7 +1291,7 @@ mod tests {
         }];
 
         let derived = registry
-            .derive_deck_status("shell", SessionStatus::Running, &events, &[])
+            .derive_deck_status("shell", SessionStatus::Running, None, &events, &[])
             .unwrap();
 
         assert_eq!(derived.deck_status, SessionDeckStatus::Idle);
@@ -701,7 +1315,7 @@ mod tests {
         }];
 
         let derived = registry
-            .derive_deck_status("claude", SessionStatus::Running, &events, &[])
+            .derive_deck_status("claude", SessionStatus::Running, None, &events, &[])
             .unwrap();
 
         let activity = derived.activity.expect("activity");
@@ -773,7 +1387,7 @@ mod tests {
             }];
 
             let derived = registry
-                .derive_deck_status("gemini", SessionStatus::Running, &events, &[])
+                .derive_deck_status("gemini", SessionStatus::Running, None, &events, &[])
                 .unwrap();
             let activity = derived.activity.expect("activity");
 
@@ -790,11 +1404,11 @@ mod tests {
     fn derive_deck_status_treats_active_agent_state_as_running() {
         let registry = AgentRegistry;
 
-        for (id, state) in [
-            (10, "running"),
-            (20, " Busy "),
-            (30, "WORKING"),
-            (40, "\tThinking\n"),
+        for (id, state, expected) in [
+            (10, "running", SessionDeckStatus::Running),
+            (20, " Busy ", SessionDeckStatus::Running),
+            (30, "WORKING", SessionDeckStatus::Running),
+            (40, "\tThinking\n", SessionDeckStatus::Thinking),
         ] {
             let events = vec![
                 SessionEvent {
@@ -821,10 +1435,10 @@ mod tests {
             ];
 
             let derived = registry
-                .derive_deck_status("shell", SessionStatus::Running, &events, &[])
+                .derive_deck_status("shell", SessionStatus::Running, None, &events, &[])
                 .unwrap();
 
-            assert_eq!(derived.deck_status, SessionDeckStatus::Running);
+            assert_eq!(derived.deck_status, expected);
             assert_eq!(derived.source_event_id, Some(id));
         }
     }
@@ -843,7 +1457,7 @@ mod tests {
         }];
 
         let derived = registry
-            .derive_deck_status("shell", SessionStatus::Running, &[], &assignments)
+            .derive_deck_status("shell", SessionStatus::Running, None, &[], &assignments)
             .unwrap();
 
         assert_eq!(derived.deck_status, SessionDeckStatus::Waiting);
@@ -872,7 +1486,7 @@ mod tests {
         }];
 
         let derived = registry
-            .derive_deck_status("shell", SessionStatus::Running, &events, &assignments)
+            .derive_deck_status("shell", SessionStatus::Running, None, &events, &assignments)
             .unwrap();
 
         assert_eq!(derived.deck_status, SessionDeckStatus::Running);
@@ -901,7 +1515,7 @@ mod tests {
         }];
 
         let derived = registry
-            .derive_deck_status("shell", SessionStatus::Running, &events, &assignments)
+            .derive_deck_status("shell", SessionStatus::Running, None, &events, &assignments)
             .unwrap();
 
         assert_eq!(derived.deck_status, SessionDeckStatus::Waiting);
@@ -914,11 +1528,35 @@ mod tests {
         let registry = AgentRegistry;
 
         let derived = registry
-            .derive_deck_status("shell", SessionStatus::Running, &[], &[])
+            .derive_deck_status("shell", SessionStatus::Running, None, &[], &[])
             .unwrap();
 
         assert_eq!(derived.deck_status, SessionDeckStatus::Running);
         assert_eq!(derived.source_event_id, None);
+    }
+
+    #[test]
+    fn derive_deck_status_ignores_wrapper_lifecycle_for_ai_agents() {
+        let registry = AgentRegistry;
+        let events = vec![SessionEvent {
+            id: 9,
+            session_id: "session".into(),
+            kind: "agent_state".into(),
+            payload: json!({
+                "state": "working",
+                "source": "agent_helm_wrapper",
+                "tool": {"name": "codex"}
+            }),
+            created_at: 9,
+        }];
+
+        let derived = registry
+            .derive_deck_status("codex", SessionStatus::Running, None, &events, &[])
+            .unwrap();
+
+        assert_eq!(derived.deck_status, SessionDeckStatus::Idle);
+        assert_eq!(derived.source_event_id, None);
+        assert_eq!(derived.source, "ai_lifecycle");
     }
 
     #[test]

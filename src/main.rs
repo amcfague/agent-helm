@@ -8,7 +8,7 @@ use agent_helm::{
     error::Result,
     models::{
         CostFilter, CreateSession, DeleteMode, DeleteSessionRequest, ForkSessionRequest,
-        ProjectSpec, SessionDeckStatus, StructuredEvent, now_ts,
+        GroupSettingsUpdate, ProjectSpec, SessionDeckStatus, StructuredEvent, now_ts,
     },
     runtime::TmuxRuntime,
 };
@@ -348,6 +348,18 @@ enum GroupCommand {
         default_project_path: Option<String>,
         #[arg(long, visible_alias = "clear-default-working-directory")]
         clear_default_project_path: bool,
+        #[arg(long)]
+        default_agent: Option<String>,
+        #[arg(long)]
+        clear_default_agent: bool,
+        #[arg(long)]
+        default_worktree: Option<bool>,
+        #[arg(long)]
+        clear_default_worktree: bool,
+        #[arg(long)]
+        default_carry_state: Option<bool>,
+        #[arg(long)]
+        clear_default_carry_state: bool,
         #[arg(long)]
         collapsed: Option<bool>,
     },
@@ -757,13 +769,33 @@ fn run_command(
                 group,
                 default_project_path,
                 clear_default_project_path,
+                default_agent,
+                clear_default_agent,
+                default_worktree,
+                clear_default_worktree,
+                default_carry_state,
+                clear_default_carry_state,
                 collapsed,
             } => print_json_or_debug(
-                &controller.update_group(
+                &controller.update_group_settings(
                     &group,
-                    default_project_path,
-                    clear_default_project_path,
-                    collapsed,
+                    GroupSettingsUpdate {
+                        default_project_path: if clear_default_project_path {
+                            Some(String::new())
+                        } else {
+                            default_project_path
+                        },
+                        collapsed,
+                        default_agent: default_agent
+                            .map(Some)
+                            .or(clear_default_agent.then_some(None)),
+                        default_worktree: default_worktree
+                            .map(Some)
+                            .or(clear_default_worktree.then_some(None)),
+                        default_carry_state: default_carry_state
+                            .map(Some)
+                            .or(clear_default_carry_state.then_some(None)),
+                    },
                 )?,
                 json,
             )?,
@@ -1065,7 +1097,10 @@ fn run_command(
                     });
                     let output = if matches!(
                         deck_status,
-                        SessionDeckStatus::Running | SessionDeckStatus::Starting
+                        SessionDeckStatus::Occupied
+                            | SessionDeckStatus::Thinking
+                            | SessionDeckStatus::Running
+                            | SessionDeckStatus::Starting
                     ) {
                         String::new()
                     } else {
@@ -1091,9 +1126,6 @@ fn run_command(
                         }
                         TuiAction::Stop(session) => {
                             action_controller.stop(&session)?;
-                        }
-                        TuiAction::Restart(session) => {
-                            action_controller.restart(&session)?;
                         }
                         TuiAction::Fork(request) => {
                             action_controller.fork_session(request)?;
@@ -1126,6 +1158,9 @@ fn run_command(
                                 Some(default_project_path),
                             )?;
                         }
+                        TuiAction::UpdateGroup { name, update } => {
+                            action_controller.update_group_settings(&name, update)?;
+                        }
                         TuiAction::Remove { session_id, mode } => {
                             action_controller.delete_session(DeleteSessionRequest {
                                 session_id,
@@ -1150,6 +1185,9 @@ fn run_command(
                             group_name,
                         } => {
                             action_controller.move_session_to_group(&session_id, group_name)?;
+                        }
+                        TuiAction::RenameSession { session_id, name } => {
+                            action_controller.rename_session(&session_id, name)?;
                         }
                         TuiAction::SaveToolSettings(settings) => {
                             let tools = settings
@@ -1507,6 +1545,16 @@ mod tests {
             "running",
             Some(SessionDeckStatus::Queued),
             "queued",
+        ));
+        assert!(session_status_matches_filter(
+            "running",
+            Some(SessionDeckStatus::Occupied),
+            "occupied",
+        ));
+        assert!(session_status_matches_filter(
+            "running",
+            Some(SessionDeckStatus::Thinking),
+            "thinking",
         ));
     }
 

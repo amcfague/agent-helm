@@ -1563,7 +1563,7 @@ if (session.workspace_id) parts.push(`workspace ${shortId(session.workspace_id)}
 if (session.worktree_id) parts.push(`worktree ${shortId(session.worktree_id)}`);
 return parts.join(" · ");
 }
-const fleetStatusOrder = ["running", "queued", "waiting", "idle", "starting", "stopped", "errored"];
+const fleetStatusOrder = ["occupied", "thinking", "running", "queued", "waiting", "idle", "starting", "stopped", "errored"];
 function countSessionsByDeckStatus(sessions, snapshots) {
 const counts = Object.fromEntries(fleetStatusOrder.map((status) => [status, 0]));
 for (const session of sessions) {
@@ -3757,6 +3757,12 @@ mod tests {
         ));
         assert!(session_status_filter_matches(
             "running", "waiting", "waiting"
+        ));
+        assert!(session_status_filter_matches(
+            "running", "occupied", "occupied"
+        ));
+        assert!(session_status_filter_matches(
+            "running", "thinking", "thinking"
         ));
         assert!(session_status_filter_matches("running", "idle", " Idle "));
         assert!(!session_status_filter_matches("running", "idle", "waiting"));

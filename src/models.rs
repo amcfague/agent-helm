@@ -33,6 +33,8 @@ impl SessionStatus {
 #[strum(serialize_all = "snake_case")]
 pub enum SessionDeckStatus {
     Starting,
+    Occupied,
+    Thinking,
     Running,
     Queued,
     Waiting,
@@ -145,12 +147,24 @@ pub struct GroupRecord {
     pub profile: String,
     pub name: String,
     pub default_project_path: String,
+    pub default_agent: Option<String>,
+    pub default_worktree: Option<bool>,
+    pub default_carry_state: Option<bool>,
     pub collapsed: bool,
     pub display_order: i64,
     pub metadata: String,
     pub version: i64,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GroupSettingsUpdate {
+    pub default_project_path: Option<String>,
+    pub collapsed: Option<bool>,
+    pub default_agent: Option<Option<String>>,
+    pub default_worktree: Option<Option<bool>>,
+    pub default_carry_state: Option<Option<bool>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, IntoStaticStr, EnumString)]

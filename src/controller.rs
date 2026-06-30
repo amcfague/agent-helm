@@ -1,5 +1,5 @@
 use crate::{
-    adapter::AgentRegistry,
+    adapter::{AgentRegistry, TranscriptEntry},
     config::AppConfig,
     error::{AppError, Result},
     materialization::{
@@ -9,11 +9,11 @@ use crate::{
         AgentStateSyncResult, AttachmentStatus, CleanupReport, ConductorAssignmentRecord,
         ConductorRecord, ConductorStatus, CostEvent, CostFilter, CostSummary, CreateSession,
         DeleteMode, DeleteSessionRequest, DeletionResult, ForkSessionRequest, ForkSessionResult,
-        GroupRecord, LaunchSpec, McpAttachmentRecord, OutputPage, ProjectRecord, ProjectSpec,
-        ProjectTrustState, SandboxLaunchSpec, SessionRecord, SessionSearchResponse,
-        SessionSearchResult, SessionStatus, SessionStatusSnapshot, SkillAttachmentRecord,
-        StructuredEvent, WatcherEventRecord, WatcherRecord, WatcherStatus, WorkspaceRecord,
-        WorktreeRecord, WorktreeStatus, now_ts,
+        GroupRecord, GroupSettingsUpdate, LaunchSpec, McpAttachmentRecord, OutputPage,
+        ProjectRecord, ProjectSpec, ProjectTrustState, SandboxLaunchSpec, SessionRecord,
+        SessionSearchResponse, SessionSearchResult, SessionStatus, SessionStatusSnapshot,
+        SkillAttachmentRecord, StructuredEvent, WatcherEventRecord, WatcherRecord, WatcherStatus,
+        WorkspaceRecord, WorktreeRecord, WorktreeStatus, now_ts,
     },
     runtime::SessionRuntime,
     security::{
@@ -25,12 +25,14 @@ use crate::{
 };
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     env, fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{Arc, Mutex},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
@@ -45,6 +47,13 @@ pub struct ApplicationController<R: SessionRuntime> {
     agents: AgentRegistry,
     workspace: WorkspaceManager,
     read_only: bool,
+    transcript_path_cache: Arc<Mutex<BTreeMap<String, TranscriptPathCacheEntry>>>,
+}
+
+#[derive(Clone, Debug)]
+struct TranscriptPathCacheEntry {
+    path: Option<PathBuf>,
+    checked_at: i64,
 }
 
 impl<R: SessionRuntime> ApplicationController<R> {
@@ -57,6 +66,7 @@ impl<R: SessionRuntime> ApplicationController<R> {
             agents: AgentRegistry,
             workspace: WorkspaceManager,
             read_only,
+            transcript_path_cache: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -107,7 +117,17 @@ impl<R: SessionRuntime> ApplicationController<R> {
     ) -> Result<SessionRecord> {
         self.ensure_writable()?;
         self.store.init()?;
-        let agent = defaulted(request.agent, &self.config.default_agent);
+        let group_name = defaulted(request.group_name.clone(), &self.config.default_group);
+        let group = self
+            .store
+            .list_groups(&self.config.profile)?
+            .into_iter()
+            .find(|group| group.name == group_name);
+        let default_agent = group
+            .as_ref()
+            .and_then(|group| group.default_agent.as_deref())
+            .unwrap_or(&self.config.default_agent);
+        let agent = defaulted(request.agent.clone(), default_agent);
         let command = self.config.resolve_tool_command(&agent, &request.command)?;
         let inherited_worktree = inherited_worktree_id
             .as_deref()
@@ -133,11 +153,14 @@ impl<R: SessionRuntime> ApplicationController<R> {
         let auto_worktree = if requested_worktree.is_none()
             && inherited_worktree.is_none()
             && request.parent_session_id.is_none()
-            && self
-                .config
-                .tool_worktree_behavior(&agent)
-                .creates_worktree_by_default()
-        {
+            && group
+                .as_ref()
+                .and_then(|group| group.default_worktree)
+                .unwrap_or_else(|| {
+                    self.config
+                        .tool_worktree_behavior(&agent)
+                        .creates_worktree_by_default()
+                }) {
             Some(auto_worktree_branch(&agent, &request.name, &request.path))
         } else {
             None
@@ -215,7 +238,7 @@ impl<R: SessionRuntime> ApplicationController<R> {
             id: Uuid::new_v4().simple().to_string(),
             name,
             profile: self.config.profile.clone(),
-            group_name: defaulted(request.group_name, &self.config.default_group),
+            group_name,
             project_id: project.id,
             workspace_id: workspace.id,
             worktree_id,
@@ -326,18 +349,32 @@ impl<R: SessionRuntime> ApplicationController<R> {
         clear_default_project_path: bool,
         collapsed: Option<bool>,
     ) -> Result<GroupRecord> {
-        self.ensure_writable()?;
-        self.store.init()?;
         let default_project_path = if clear_default_project_path {
             Some(String::new())
         } else {
             default_project_path
         };
+        self.update_group_settings(
+            name,
+            GroupSettingsUpdate {
+                default_project_path,
+                collapsed,
+                ..GroupSettingsUpdate::default()
+            },
+        )
+    }
+
+    pub fn update_group_settings(
+        &self,
+        name: &str,
+        update: GroupSettingsUpdate,
+    ) -> Result<GroupRecord> {
+        self.ensure_writable()?;
+        self.store.init()?;
         self.store.update_group(
             &self.config.profile,
             &defaulted(name.to_string(), &self.config.default_group),
-            default_project_path.as_deref(),
-            collapsed,
+            &update,
         )
     }
 
@@ -358,6 +395,16 @@ impl<R: SessionRuntime> ApplicationController<R> {
             session.version,
             &defaulted(group_name, &self.config.default_group),
         )
+    }
+
+    pub fn rename_session(&self, id: &str, name: String) -> Result<SessionRecord> {
+        self.ensure_writable()?;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(AppError::msg("session name required"));
+        }
+        let session = self.get_session(id)?;
+        self.store.update_session_name(id, session.version, name)
     }
 
     pub fn get_session(&self, id: &str) -> Result<SessionRecord> {
@@ -418,10 +465,13 @@ impl<R: SessionRuntime> ApplicationController<R> {
     pub fn status_snapshot(&self, id: &str) -> Result<SessionStatusSnapshot> {
         let session = self.status(id)?;
         let recent_events = self.store.latest_session_status_signal_events(id, 20)?;
+        let transcript_state =
+            self.transcript_agent_state_for_snapshot(&session, &recent_events)?;
         let open_assignments = self.store.open_conductor_assignments_for_session(id)?;
         let derivation = self.agents.derive_deck_status(
             &session.agent,
             session.status,
+            transcript_state.as_ref(),
             &recent_events,
             &open_assignments,
         )?;
@@ -433,6 +483,99 @@ impl<R: SessionRuntime> ApplicationController<R> {
             source: derivation.source,
             activity: derivation.activity,
         })
+    }
+
+    fn transcript_agent_state_for_snapshot(
+        &self,
+        session: &SessionRecord,
+        recent_events: &[crate::models::SessionEvent],
+    ) -> Result<Option<Value>> {
+        if let Some((_, payload)) =
+            latest_transcript_agent_state_from_events(session, recent_events)?
+        {
+            self.cache_transcript_path(session, &payload);
+            return Ok(Some(payload));
+        }
+
+        if let Some(path) = self.cached_transcript_path(&session.id) {
+            if let Some((_, payload)) =
+                latest_transcript_agent_state_from_path(session, &path, true)?
+            {
+                self.cache_transcript_path(session, &payload);
+                return Ok(Some(payload));
+            }
+            self.clear_cached_transcript_path(&session.id, &path);
+        }
+
+        if self.should_skip_transcript_discovery(&session.id) {
+            return Ok(None);
+        }
+
+        if let Some((_, payload)) = latest_recent_transcript_agent_state(session)? {
+            self.cache_transcript_path(session, &payload);
+            return Ok(Some(payload));
+        }
+
+        self.cache_transcript_miss(session);
+        Ok(None)
+    }
+
+    fn cached_transcript_path(&self, session_id: &str) -> Option<PathBuf> {
+        self.transcript_path_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(session_id).and_then(|entry| entry.path.clone()))
+    }
+
+    fn should_skip_transcript_discovery(&self, session_id: &str) -> bool {
+        self.transcript_path_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(session_id).cloned())
+            .is_some_and(|entry| {
+                entry.path.is_none()
+                    && now_ts().saturating_sub(entry.checked_at)
+                        < SNAPSHOT_TRANSCRIPT_DISCOVERY_RETRY_SECS
+            })
+    }
+
+    fn cache_transcript_path(&self, session: &SessionRecord, payload: &Value) {
+        let Some(path) = payload.get("transcript_path").and_then(Value::as_str) else {
+            return;
+        };
+        if let Ok(mut cache) = self.transcript_path_cache.lock() {
+            cache.insert(
+                session.id.clone(),
+                TranscriptPathCacheEntry {
+                    path: Some(PathBuf::from(path)),
+                    checked_at: now_ts(),
+                },
+            );
+        }
+    }
+
+    fn cache_transcript_miss(&self, session: &SessionRecord) {
+        if let Ok(mut cache) = self.transcript_path_cache.lock() {
+            cache.insert(
+                session.id.clone(),
+                TranscriptPathCacheEntry {
+                    path: None,
+                    checked_at: now_ts(),
+                },
+            );
+        }
+    }
+
+    fn clear_cached_transcript_path(&self, session_id: &str, path: &Path) {
+        if let Ok(mut cache) = self.transcript_path_cache.lock() {
+            if cache
+                .get(session_id)
+                .and_then(|entry| entry.path.as_deref())
+                .is_some_and(|cached| cached == path)
+            {
+                cache.remove(session_id);
+            }
+        }
     }
 
     pub fn output(&self, id: &str, limit: usize, ansi: bool) -> Result<OutputPage> {
@@ -2341,6 +2484,66 @@ fn collect_jsonl_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+fn recent_jsonl_files(root: &Path, session: &SessionRecord, limit: usize) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let min_modified_at = session.created_at.saturating_sub(60);
+    collect_recent_jsonl_files(root, min_modified_at, &mut files)?;
+    files.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+    files.truncate(limit);
+    Ok(files.into_iter().map(|(_, path)| path).collect())
+}
+
+fn collect_recent_jsonl_files(
+    dir: &Path,
+    min_modified_at: i64,
+    files: &mut Vec<(i64, PathBuf)>,
+) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_recent_jsonl_files(&path, min_modified_at, files)?;
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            let modified_at = modified_at_secs(&path).unwrap_or(0);
+            if modified_at >= min_modified_at {
+                files.push((modified_at, path));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn modified_at_secs(path: &Path) -> Option<i64> {
+    fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+}
+
+fn created_at_secs(path: &Path) -> Option<i64> {
+    fs::metadata(path)
+        .ok()?
+        .created()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+}
+
+fn transcript_file_started_near_session(file: &Path, session: &SessionRecord) -> bool {
+    let Some(created_at) = created_at_secs(file) else {
+        return false;
+    };
+    created_at >= session.created_at.saturating_sub(60)
+        && created_at
+            <= session
+                .created_at
+                .saturating_add(TRANSCRIPT_CWD_MATCH_START_TOLERANCE_SECS)
+}
+
 fn search_claude_transcript_file(path: &Path, needle: &str) -> Result<Option<SessionSearchResult>> {
     let file = fs::File::open(path)?;
     let mut fallback_session_id = path
@@ -2438,6 +2641,10 @@ fn search_codex_transcript_file(path: &Path, needle: &str) -> Result<Option<Sess
     Ok(None)
 }
 
+const SNAPSHOT_TRANSCRIPT_DISCOVERY_LIMIT: usize = 16;
+const SNAPSHOT_TRANSCRIPT_DISCOVERY_RETRY_SECS: i64 = 3;
+const TRANSCRIPT_CWD_MATCH_START_TOLERANCE_SECS: i64 = 600;
+
 fn latest_transcript_agent_state(session: &SessionRecord) -> Result<Option<(&'static str, Value)>> {
     match session.agent.as_str() {
         "claude" => {
@@ -2454,6 +2661,68 @@ fn latest_transcript_agent_state(session: &SessionRecord) -> Result<Option<(&'st
             latest_codex_agent_state_in(&root, session)
                 .map(|payload| payload.map(|payload| ("codex_transcript", payload)))
         }
+        _ => Ok(None),
+    }
+}
+
+fn latest_recent_transcript_agent_state(
+    session: &SessionRecord,
+) -> Result<Option<(&'static str, Value)>> {
+    match session.agent.as_str() {
+        "claude" => {
+            let Some(root) = claude_projects_dir() else {
+                return Ok(None);
+            };
+            latest_recent_claude_agent_state_in(&root, session, SNAPSHOT_TRANSCRIPT_DISCOVERY_LIMIT)
+                .map(|payload| payload.map(|payload| ("claude_transcript", payload)))
+        }
+        "codex" => {
+            let Some(root) = codex_sessions_dir() else {
+                return Ok(None);
+            };
+            latest_recent_codex_agent_state_in(&root, session, SNAPSHOT_TRANSCRIPT_DISCOVERY_LIMIT)
+                .map(|payload| payload.map(|payload| ("codex_transcript", payload)))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn latest_transcript_agent_state_from_events(
+    session: &SessionRecord,
+    recent_events: &[crate::models::SessionEvent],
+) -> Result<Option<(&'static str, Value)>> {
+    let source = transcript_source_for_agent(&session.agent);
+    if source == "unsupported_agent" {
+        return Ok(None);
+    }
+    let Some(path) = recent_events.iter().find_map(|event| {
+        if event.kind != "agent_state"
+            || event.payload.get("source").and_then(Value::as_str) != Some(source.as_str())
+        {
+            return None;
+        }
+        event
+            .payload
+            .get("transcript_path")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+    }) else {
+        return Ok(None);
+    };
+
+    latest_transcript_agent_state_from_path(session, &path, true)
+}
+
+fn latest_transcript_agent_state_from_path(
+    session: &SessionRecord,
+    path: &Path,
+    allow_cwd_match: bool,
+) -> Result<Option<(&'static str, Value)>> {
+    match session.agent.as_str() {
+        "claude" => latest_claude_agent_state_file(path, session, allow_cwd_match)
+            .map(|payload| payload.map(|payload| ("claude_transcript", payload))),
+        "codex" => latest_codex_agent_state_file(path, session, allow_cwd_match)
+            .map(|payload| payload.map(|payload| ("codex_transcript", payload))),
         _ => Ok(None),
     }
 }
@@ -2477,52 +2746,103 @@ fn latest_claude_agent_state_in(root: &Path, session: &SessionRecord) -> Result<
 
     let mut latest = None;
     for file in files {
-        let stem_matches_session = file
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name == session.id);
-        let reader = BufReader::new(fs::File::open(&file)?);
-        for (index, line) in reader.lines().enumerate() {
-            let line = line?;
-            let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            if !stem_matches_session && !claude_transcript_matches_session(&value, session) {
-                continue;
-            }
-            let Some(mut payload) = claude_agent_state_payload(&value) else {
-                continue;
-            };
-            if let Some(object) = payload.as_object_mut() {
-                object.insert(
-                    "transcript_path".to_string(),
-                    json!(file.to_string_lossy().to_string()),
-                );
-                object.insert("transcript_line".to_string(), json!((index + 1) as i64));
-                if let Some(session_id) = json_string(&value, "agent_helm_session_id")
-                    .or_else(|| json_string(&value, "agentHelmSessionId"))
-                    .or_else(|| json_string(&value, "sessionId"))
-                    .or_else(|| json_string(&value, "session_id"))
-                {
-                    object.insert("transcript_session_id".to_string(), json!(session_id));
-                }
-                if let Some(cwd) = json_string(&value, "cwd") {
-                    object.insert("cwd".to_string(), json!(cwd));
-                }
-            }
+        if let Some(payload) = latest_claude_agent_state_file(&file, session, false)? {
             latest = Some(payload);
         }
     }
     Ok(latest)
 }
 
-fn claude_transcript_matches_session(value: &Value, session: &SessionRecord) -> bool {
-    json_string(value, "agent_helm_session_id")
+fn latest_recent_claude_agent_state_in(
+    root: &Path,
+    session: &SessionRecord,
+    limit: usize,
+) -> Result<Option<Value>> {
+    if !root.exists() {
+        return Ok(None);
+    }
+
+    for file in recent_jsonl_files(root, session, limit)? {
+        if let Some(payload) = latest_claude_agent_state_file(&file, session, true)? {
+            return Ok(Some(payload));
+        }
+    }
+
+    Ok(None)
+}
+
+fn latest_claude_agent_state_file(
+    file: &Path,
+    session: &SessionRecord,
+    allow_cwd_match: bool,
+) -> Result<Option<Value>> {
+    if !file.exists() {
+        return Ok(None);
+    }
+    let stem_matches_session = file
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == session.id);
+    let allow_cwd_match = allow_cwd_match && transcript_file_started_near_session(file, session);
+    let reader = BufReader::new(fs::File::open(file)?);
+    let mut entries = Vec::new();
+    let mut metadata = Vec::new();
+    for (index, line) in reader.lines().enumerate() {
+        let line = line?;
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if !stem_matches_session
+            && !claude_transcript_matches_session(&value, session, allow_cwd_match)
+        {
+            continue;
+        }
+        let line = (index + 1) as i64;
+        metadata.push((line, value.clone()));
+        entries.push(TranscriptEntry { line, value });
+    }
+    let Some(mut state) = AgentRegistry.derive_transcript_agent_state("claude", &entries)? else {
+        return Ok(None);
+    };
+    if let Some(object) = state.payload.as_object_mut() {
+        object.insert(
+            "transcript_path".to_string(),
+            json!(file.to_string_lossy().to_string()),
+        );
+        object.insert("transcript_line".to_string(), json!(state.line));
+        if let Some(value) = metadata
+            .iter()
+            .find(|(line, _)| *line == state.line)
+            .map(|(_, value)| value)
+        {
+            if let Some(session_id) = json_string(value, "agent_helm_session_id")
+                .or_else(|| json_string(value, "agentHelmSessionId"))
+                .or_else(|| json_string(value, "sessionId"))
+                .or_else(|| json_string(value, "session_id"))
+            {
+                object.insert("transcript_session_id".to_string(), json!(session_id));
+            }
+            if let Some(cwd) = json_string(value, "cwd") {
+                object.insert("cwd".to_string(), json!(cwd));
+            }
+        }
+    }
+    Ok(Some(state.payload))
+}
+
+fn claude_transcript_matches_session(
+    value: &Value,
+    session: &SessionRecord,
+    allow_cwd_match: bool,
+) -> bool {
+    let session_id_matches = json_string(value, "agent_helm_session_id")
         .or_else(|| json_string(value, "agentHelmSessionId"))
         .or_else(|| json_string(value, "sessionId"))
         .or_else(|| json_string(value, "session_id"))
-        .is_some_and(|id| id == session.id)
-        || json_string(value, "cwd").is_some_and(|cwd| cwd == session.project_path)
+        .is_some_and(|id| id == session.id);
+    session_id_matches
+        || (allow_cwd_match
+            && json_string(value, "cwd").is_some_and(|cwd| cwd == session.project_path))
 }
 
 fn latest_codex_agent_state_in(root: &Path, session: &SessionRecord) -> Result<Option<Value>> {
@@ -2555,7 +2875,7 @@ fn latest_codex_agent_state_in(root: &Path, session: &SessionRecord) -> Result<O
             if let Some(session_id) = transcript_session_id(&value) {
                 file_session_id = Some(session_id.to_string());
             }
-            if codex_transcript_matches_session(&value, session) {
+            if codex_transcript_matches_session(&value, session, false) {
                 file_matches_session = true;
             }
             rows.push((index + 1, value));
@@ -2564,67 +2884,141 @@ fn latest_codex_agent_state_in(root: &Path, session: &SessionRecord) -> Result<O
             continue;
         }
 
-        for (line, value) in rows {
-            let Some(mut payload) = codex_agent_state_payload(&value) else {
-                continue;
-            };
-            if let Some(object) = payload.as_object_mut() {
-                object.insert(
-                    "transcript_path".to_string(),
-                    json!(file.to_string_lossy().to_string()),
-                );
-                object.insert("transcript_line".to_string(), json!(line as i64));
-                if let Some(session_id) = transcript_session_id(&value) {
-                    object.insert("transcript_session_id".to_string(), json!(session_id));
-                } else if let Some(session_id) = file_session_id.as_deref() {
-                    object.insert("transcript_session_id".to_string(), json!(session_id));
-                }
-                if let Some(cwd) = codex_transcript_cwd(&value) {
-                    object.insert("cwd".to_string(), json!(cwd));
-                } else if let Some(cwd) = file_cwd.as_deref() {
-                    object.insert("cwd".to_string(), json!(cwd));
-                }
+        let entries = rows
+            .iter()
+            .map(|(line, value)| TranscriptEntry {
+                line: *line as i64,
+                value: value.clone(),
+            })
+            .collect::<Vec<_>>();
+        let Some(mut state) = AgentRegistry.derive_transcript_agent_state("codex", &entries)?
+        else {
+            continue;
+        };
+        let state_value = rows
+            .iter()
+            .find(|(line, _)| *line as i64 == state.line)
+            .map(|(_, value)| value);
+        if let Some(object) = state.payload.as_object_mut() {
+            object.insert(
+                "transcript_path".to_string(),
+                json!(file.to_string_lossy().to_string()),
+            );
+            object.insert("transcript_line".to_string(), json!(state.line));
+            if let Some(session_id) = state_value.and_then(transcript_session_id) {
+                object.insert("transcript_session_id".to_string(), json!(session_id));
+            } else if let Some(session_id) = file_session_id.as_deref() {
+                object.insert("transcript_session_id".to_string(), json!(session_id));
             }
-            latest = Some(payload);
+            if let Some(cwd) = state_value.and_then(codex_transcript_cwd) {
+                object.insert("cwd".to_string(), json!(cwd));
+            } else if let Some(cwd) = file_cwd.as_deref() {
+                object.insert("cwd".to_string(), json!(cwd));
+            }
         }
+        latest = Some(state.payload);
     }
     Ok(latest)
 }
 
-fn codex_transcript_matches_session(value: &Value, session: &SessionRecord) -> bool {
-    transcript_session_id(value).is_some_and(|id| id == session.id)
-        || codex_transcript_cwd(value).is_some_and(|cwd| cwd == session.project_path)
+fn latest_recent_codex_agent_state_in(
+    root: &Path,
+    session: &SessionRecord,
+    limit: usize,
+) -> Result<Option<Value>> {
+    if !root.exists() {
+        return Ok(None);
+    }
+
+    for file in recent_jsonl_files(root, session, limit)? {
+        if let Some(payload) = latest_codex_agent_state_file(&file, session, true)? {
+            return Ok(Some(payload));
+        }
+    }
+
+    Ok(None)
 }
 
-fn codex_agent_state_payload(value: &Value) -> Option<Value> {
-    let payload = codex_event_payload(value);
-    let event_type = json_string(payload, "type").or_else(|| json_string(value, "type"))?;
-    let (state, tool) = match event_type {
-        "function_call" | "custom_tool_call" => ("working", codex_tool_name(payload)),
-        "function_call_output"
-        | "custom_tool_call_output"
-        | "mcp_tool_call_end"
-        | "patch_apply_end" => ("idle", codex_tool_name(payload)),
-        "task_started" | "user_message" => ("working", None),
-        "reasoning" => ("thinking", None),
-        "agent_message" | "message" | "task_complete" | "turn_aborted" => ("idle", None),
-        _ => return None,
+fn latest_codex_agent_state_file(
+    file: &Path,
+    session: &SessionRecord,
+    allow_cwd_match: bool,
+) -> Result<Option<Value>> {
+    if !file.exists() {
+        return Ok(None);
+    }
+    let stem_matches_session = file
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == session.id);
+    let allow_cwd_match = allow_cwd_match && transcript_file_started_near_session(file, session);
+    let reader = BufReader::new(fs::File::open(file)?);
+    let mut rows = Vec::new();
+    let mut file_matches_session = stem_matches_session;
+    let mut file_cwd = None;
+    let mut file_session_id = None;
+    for (index, line) in reader.lines().enumerate() {
+        let line = line?;
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if let Some(cwd) = codex_transcript_cwd(&value) {
+            file_cwd = Some(cwd.to_string());
+        }
+        if let Some(session_id) = transcript_session_id(&value) {
+            file_session_id = Some(session_id.to_string());
+        }
+        if codex_transcript_matches_session(&value, session, allow_cwd_match) {
+            file_matches_session = true;
+        }
+        rows.push((index + 1, value));
+    }
+    if !file_matches_session {
+        return Ok(None);
+    }
+
+    let entries = rows
+        .iter()
+        .map(|(line, value)| TranscriptEntry {
+            line: *line as i64,
+            value: value.clone(),
+        })
+        .collect::<Vec<_>>();
+    let Some(mut state) = AgentRegistry.derive_transcript_agent_state("codex", &entries)? else {
+        return Ok(None);
     };
-    let mut state_payload = serde_json::Map::from_iter([
-        ("state".to_string(), json!(state)),
-        ("source".to_string(), json!("codex_transcript")),
-        ("transcript_event".to_string(), json!(event_type)),
-    ]);
-    if let Some(call_id) = json_string(payload, "call_id") {
-        state_payload.insert("call_id".to_string(), json!(call_id));
+    let state_value = rows
+        .iter()
+        .find(|(line, _)| *line as i64 == state.line)
+        .map(|(_, value)| value);
+    if let Some(object) = state.payload.as_object_mut() {
+        object.insert(
+            "transcript_path".to_string(),
+            json!(file.to_string_lossy().to_string()),
+        );
+        object.insert("transcript_line".to_string(), json!(state.line));
+        if let Some(session_id) = state_value.and_then(transcript_session_id) {
+            object.insert("transcript_session_id".to_string(), json!(session_id));
+        } else if let Some(session_id) = file_session_id.as_deref() {
+            object.insert("transcript_session_id".to_string(), json!(session_id));
+        }
+        if let Some(cwd) = state_value.and_then(codex_transcript_cwd) {
+            object.insert("cwd".to_string(), json!(cwd));
+        } else if let Some(cwd) = file_cwd.as_deref() {
+            object.insert("cwd".to_string(), json!(cwd));
+        }
     }
-    if let Some(status) = json_string(payload, "status") {
-        state_payload.insert("status".to_string(), json!(status));
-    }
-    if let Some(tool) = tool {
-        state_payload.insert("tool".to_string(), json!({ "name": tool }));
-    }
-    Some(Value::Object(state_payload))
+    Ok(Some(state.payload))
+}
+
+fn codex_transcript_matches_session(
+    value: &Value,
+    session: &SessionRecord,
+    allow_cwd_match: bool,
+) -> bool {
+    transcript_session_id(value).is_some_and(|id| id == session.id)
+        || (allow_cwd_match
+            && codex_transcript_cwd(value).is_some_and(|cwd| cwd == session.project_path))
 }
 
 fn codex_event_payload(value: &Value) -> &Value {
@@ -2688,60 +3082,6 @@ fn codex_search_text(value: &Value) -> Option<String> {
     }
     let text = parts.join("\n");
     (!text.is_empty()).then_some(text)
-}
-
-fn claude_agent_state_payload(value: &Value) -> Option<Value> {
-    let content = value
-        .get("message")
-        .and_then(|message| message.get("content"))
-        .or_else(|| value.get("content"));
-    let tool = content.and_then(claude_tool_use_name);
-    let role = value
-        .get("message")
-        .and_then(|message| json_string(message, "role"))
-        .or_else(|| json_string(value, "role"))
-        .or_else(|| json_string(value, "type"))
-        .unwrap_or("");
-    let state = if tool.is_some() || role.eq_ignore_ascii_case("user") {
-        "working"
-    } else if role.eq_ignore_ascii_case("assistant") {
-        "idle"
-    } else {
-        return None;
-    };
-    let mut payload = serde_json::Map::from_iter([
-        ("state".to_string(), json!(state)),
-        ("source".to_string(), json!("claude_transcript")),
-    ]);
-    if !role.is_empty() {
-        payload.insert("transcript_role".to_string(), json!(role));
-    }
-    if let Some(tool) = tool {
-        payload.insert("tool".to_string(), json!({ "name": tool }));
-    }
-    Some(Value::Object(payload))
-}
-
-fn claude_tool_use_name(value: &Value) -> Option<String> {
-    match value {
-        Value::Array(items) => items.iter().find_map(claude_tool_use_name),
-        Value::Object(object) => {
-            if object
-                .get("type")
-                .and_then(Value::as_str)
-                .is_some_and(|kind| kind == "tool_use")
-            {
-                return object
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|name| !name.is_empty())
-                    .map(str::to_string);
-            }
-            object.get("content").and_then(claude_tool_use_name)
-        }
-        _ => None,
-    }
 }
 
 fn claude_message_text(value: &serde_json::Value) -> Option<String> {
@@ -4533,7 +4873,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(payload["state"], "working");
+        assert_eq!(payload["state"], "occupied");
         assert_eq!(payload["source"], "claude_transcript");
         assert_eq!(payload["tool"]["name"], "Bash");
         assert_eq!(payload["transcript_line"], 2);
@@ -4645,7 +4985,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(payload["state"], "working");
+        assert_eq!(payload["state"], "occupied");
         assert_eq!(payload["source"], "codex_transcript");
         assert_eq!(payload["transcript_event"], "function_call");
         assert_eq!(payload["tool"]["name"], "shell");
@@ -4653,6 +4993,147 @@ mod tests {
         assert_eq!(payload["transcript_line"], 3);
         assert_eq!(payload["transcript_session_id"], "agent-helm-session");
         assert_eq!(payload["cwd"], "/Users/test/project");
+    }
+
+    #[test]
+    fn transcript_state_from_events_uses_known_path_without_scanning() {
+        let home = tempfile::tempdir().unwrap();
+        let transcript = home.path().join("rollout-session.jsonl");
+        std::fs::write(
+            &transcript,
+            r#"{"type":"session_meta","payload":{"agent_helm_session_id":"agent-helm-session","cwd":"/Users/test/project"}}
+{"type":"response_item","payload":{"type":"function_call","call_id":"call-1","name":"shell","arguments":"{\"cmd\":\"cargo test\"}"}}"#,
+        )
+        .unwrap();
+        let session = SessionRecord {
+            id: "agent-helm-session".into(),
+            name: "codex".into(),
+            profile: "test".into(),
+            group_name: "default".into(),
+            project_id: "project".into(),
+            workspace_id: "workspace".into(),
+            worktree_id: None,
+            parent_session_id: None,
+            agent: "codex".into(),
+            command: "codex".into(),
+            project_path: "/Users/test/project".into(),
+            status: SessionStatus::Running,
+            runtime_id: None,
+            archived: false,
+            version: 0,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        assert!(
+            latest_transcript_agent_state_from_events(&session, &[])
+                .unwrap()
+                .is_none()
+        );
+
+        let events = vec![crate::models::SessionEvent {
+            id: 1,
+            session_id: session.id.clone(),
+            kind: "agent_state".into(),
+            payload: json!({
+                "state": "thinking",
+                "source": "codex_transcript",
+                "transcript_path": transcript.to_string_lossy(),
+                "transcript_line": 1
+            }),
+            created_at: 0,
+        }];
+        let (_, payload) = latest_transcript_agent_state_from_events(&session, &events)
+            .unwrap()
+            .expect("known transcript state");
+
+        assert_eq!(payload["state"], "occupied");
+        assert_eq!(payload["tool"]["name"], "shell");
+        assert_eq!(
+            payload["transcript_path"].as_str(),
+            Some(transcript.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn latest_recent_codex_agent_state_discovers_recent_cwd_transcript() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".codex/sessions/2026/06/26");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+        root.join("rollout-session.jsonl"),
+        r#"{"type":"session_meta","payload":{"cwd":"/Users/test/project"}}
+{"type":"response_item","payload":{"type":"reasoning","summary":[]}}
+{"type":"response_item","payload":{"type":"function_call","call_id":"call-1","name":"shell","arguments":"{\"cmd\":\"cargo test\"}"}}"#,
+    )
+    .unwrap();
+
+        let session = SessionRecord {
+            id: "agent-helm-session".into(),
+            name: "codex".into(),
+            profile: "test".into(),
+            group_name: "default".into(),
+            project_id: "project".into(),
+            workspace_id: "workspace".into(),
+            worktree_id: None,
+            parent_session_id: None,
+            agent: "codex".into(),
+            command: "codex".into(),
+            project_path: "/Users/test/project".into(),
+            status: SessionStatus::Running,
+            runtime_id: None,
+            archived: false,
+            version: 0,
+            created_at: now_ts(),
+            updated_at: 0,
+        };
+
+        let payload =
+            latest_recent_codex_agent_state_in(&home.path().join(".codex/sessions"), &session, 16)
+                .unwrap()
+                .unwrap();
+        assert_eq!(payload["state"], "occupied");
+        assert_eq!(payload["source"], "codex_transcript");
+        assert_eq!(payload["cwd"], "/Users/test/project");
+    }
+
+    #[test]
+    fn latest_codex_agent_state_rejects_older_cwd_only_transcript() {
+        let home = tempfile::tempdir().unwrap();
+        let transcript = home.path().join("rollout-session.jsonl");
+        std::fs::write(
+        &transcript,
+        r#"{"type":"session_meta","payload":{"cwd":"/Users/test/project"}}
+{"type":"response_item","payload":{"type":"reasoning","summary":[]}}
+{"type":"response_item","payload":{"type":"function_call","call_id":"call-1","name":"shell","arguments":"{\"cmd\":\"cargo test\"}"}}"#,
+    )
+    .unwrap();
+
+        let session = SessionRecord {
+            id: "agent-helm-session".into(),
+            name: "codex".into(),
+            profile: "test".into(),
+            group_name: "default".into(),
+            project_id: "project".into(),
+            workspace_id: "workspace".into(),
+            worktree_id: None,
+            parent_session_id: None,
+            agent: "codex".into(),
+            command: "codex".into(),
+            project_path: "/Users/test/project".into(),
+            status: SessionStatus::Running,
+            runtime_id: None,
+            archived: false,
+            version: 0,
+            created_at: now_ts().saturating_add(TRANSCRIPT_CWD_MATCH_START_TOLERANCE_SECS + 120),
+            updated_at: 0,
+        };
+
+        assert!(
+            latest_codex_agent_state_file(&transcript, &session, true)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -4672,6 +5153,21 @@ mod tests {
             .unwrap();
         assert_eq!(group.default_project_path, "/tmp/next");
         assert!(group.collapsed);
+
+        let group = controller
+            .update_group_settings(
+                "work/api",
+                GroupSettingsUpdate {
+                    default_agent: Some(Some("codex".into())),
+                    default_worktree: Some(Some(true)),
+                    default_carry_state: Some(Some(true)),
+                    ..GroupSettingsUpdate::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(group.default_agent.as_deref(), Some("codex"));
+        assert_eq!(group.default_worktree, Some(true));
+        assert_eq!(group.default_carry_state, Some(true));
 
         controller.delete_group("work/api", false).unwrap();
         assert!(
