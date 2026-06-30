@@ -62,9 +62,9 @@ const EMBED_MIN_COLS: u16 = 10;
 const SGR_MOUSE_WHEEL_UP: u8 = 64;
 #[cfg(test)]
 const SGR_MOUSE_WHEEL_DOWN: u8 = 65;
-const DEFAULT_SIDEBAR_PERCENT: u16 = 24;
-const MIN_SIDEBAR_PERCENT: u16 = 18;
+const MIN_SIDEBAR_WIDTH: u16 = 8;
 const MAX_SIDEBAR_PERCENT: u16 = 50;
+const SIDEBAR_LIST_PADDING: u16 = 4;
 const DIVIDER_HIT_COLUMNS: u16 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -619,7 +619,7 @@ struct App {
     detail_scroll: u16,
     preview_scroll: u16,
     status_filter: StatusFilter,
-    sidebar_percent: u16,
+    sidebar_width: Option<u16>,
     resizing_sidebar: bool,
     mouse_capture: bool,
     animation_frame: usize,
@@ -663,7 +663,7 @@ fn app_from_initial(initial: TuiInitialState) -> App {
         detail_scroll: 0,
         preview_scroll: 0,
         status_filter: StatusFilter::All,
-        sidebar_percent: DEFAULT_SIDEBAR_PERCENT,
+        sidebar_width: None,
         resizing_sidebar: false,
         mouse_capture: true,
         animation_frame: 0,
@@ -2473,7 +2473,8 @@ fn sync_embedded_tmux(
         return false;
     }
 
-    let Some(session) = app.view().selected else {
+    let view = app.view();
+    let Some(session) = view.selected.as_ref() else {
         app.embedded = None;
         app.mode = Mode::Normal;
         app.status_message = Some("no session selected".to_string());
@@ -2492,7 +2493,7 @@ fn sync_embedded_tmux(
     let Ok(size) = terminal.size() else {
         return false;
     };
-    let area = embedded_terminal_area(size, app.sidebar_percent);
+    let area = embedded_terminal_area(size, &view, app.sidebar_width);
     let rows = area.height.max(EMBED_MIN_ROWS);
     let cols = area.width.max(EMBED_MIN_COLS);
     let target = session
@@ -2552,7 +2553,7 @@ fn sync_terminal_preview(
     let Ok(size) = terminal.size() else {
         return changed;
     };
-    let area = terminal_preview_area(size, app.sidebar_percent);
+    let area = terminal_preview_area(size, &view, app.sidebar_width);
     if area.width == 0 || area.height == 0 {
         return clear_terminal_preview(app) || changed;
     }
@@ -2644,7 +2645,11 @@ fn next_preview_request(
     }
 }
 
-fn embedded_terminal_area(size: ratatui::layout::Size, sidebar_percent: u16) -> Rect {
+fn embedded_terminal_area(
+    size: ratatui::layout::Size,
+    view: &DashboardView,
+    sidebar_width: Option<u16>,
+) -> Rect {
     let area = Rect::new(0, 0, size.width, size.height);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -2654,11 +2659,15 @@ fn embedded_terminal_area(size: ratatui::layout::Size, sidebar_percent: u16) -> 
             Constraint::Length(1),
         ])
         .split(area);
-    let body = body_layout(chunks[1], sidebar_percent);
+    let body = body_layout_for_view(chunks[1], view, sidebar_width, 0);
     panel_block("SESSION").inner(body.detail)
 }
 
-fn terminal_preview_area(size: ratatui::layout::Size, sidebar_percent: u16) -> Rect {
+fn terminal_preview_area(
+    size: ratatui::layout::Size,
+    view: &DashboardView,
+    sidebar_width: Option<u16>,
+) -> Rect {
     let area = Rect::new(0, 0, size.width, size.height);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -2668,7 +2677,7 @@ fn terminal_preview_area(size: ratatui::layout::Size, sidebar_percent: u16) -> R
             Constraint::Length(1),
         ])
         .split(area);
-    let body = body_layout(chunks[1], sidebar_percent);
+    let body = body_layout_for_view(chunks[1], view, sidebar_width, 0);
     panel_block("PREVIEW").inner(body.detail)
 }
 
@@ -2785,10 +2794,10 @@ fn process_mouse(app: &mut App, mouse: MouseEvent, area: Rect) -> bool {
         }
         MouseEventKind::Down(MouseButton::Left) if mouse_on_divider(mouse, area, app) => {
             app.resizing_sidebar = true;
-            set_sidebar_percent_from_mouse(app, mouse.column, area)
+            set_sidebar_width_from_mouse(app, mouse.column, area)
         }
         MouseEventKind::Drag(MouseButton::Left) if app.resizing_sidebar => {
-            set_sidebar_percent_from_mouse(app, mouse.column, area)
+            set_sidebar_width_from_mouse(app, mouse.column, area)
         }
         MouseEventKind::Up(MouseButton::Left) => {
             let was_resizing = app.resizing_sidebar;
@@ -2805,7 +2814,8 @@ fn scroll_embedded_session(app: &mut App, mouse: MouseEvent, area: Rect) -> bool
             width: area.width,
             height: area.height,
         },
-        app.sidebar_percent,
+        &app.view(),
+        app.sidebar_width,
     );
     if !point_in_rect(mouse.column, mouse.row, terminal_area) {
         return false;
@@ -3971,12 +3981,22 @@ struct BodyLayout {
     detail: Rect,
 }
 
-fn body_layout(area: Rect, sidebar_percent: u16) -> BodyLayout {
-    let sidebar_percent = sidebar_percent.clamp(MIN_SIDEBAR_PERCENT, MAX_SIDEBAR_PERCENT);
+fn body_layout_for_view(
+    area: Rect,
+    view: &DashboardView,
+    sidebar_width: Option<u16>,
+    animation_frame: usize,
+) -> BodyLayout {
+    let width = sidebar_width.unwrap_or_else(|| auto_sidebar_width(area, view, animation_frame));
+    body_layout(area, width)
+}
+
+fn body_layout(area: Rect, sidebar_width: u16) -> BodyLayout {
+    let sidebar_width = clamp_sidebar_width(area, sidebar_width);
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(sidebar_percent),
+            Constraint::Length(sidebar_width),
             Constraint::Length(1),
             Constraint::Min(0),
         ])
@@ -3989,6 +4009,107 @@ fn body_layout(area: Rect, sidebar_percent: u16) -> BodyLayout {
     }
 }
 
+fn auto_sidebar_width(area: Rect, view: &DashboardView, animation_frame: usize) -> u16 {
+    clamp_sidebar_width(
+        area,
+        sidebar_content_width(view, animation_frame).saturating_add(SIDEBAR_LIST_PADDING),
+    )
+}
+
+fn clamp_sidebar_width(area: Rect, width: u16) -> u16 {
+    let max_width = area
+        .width
+        .saturating_mul(MAX_SIDEBAR_PERCENT)
+        .saturating_div(100)
+        .min(area.width.saturating_sub(1));
+    if max_width == 0 {
+        return 0;
+    }
+    let min_width = MIN_SIDEBAR_WIDTH.min(max_width);
+    width.clamp(min_width, max_width)
+}
+
+fn sidebar_content_width(view: &DashboardView, animation_frame: usize) -> u16 {
+    let mut width = if view.rows.is_empty() {
+        display_width("No sessions. Press n to create one.")
+    } else {
+        0
+    };
+    for row in &view.rows {
+        let row_width = match row {
+            DashboardRow::Group {
+                group_index,
+                name,
+                collapsed,
+                session_count,
+                counts,
+            } => display_width(&group_header_row_text(
+                *group_index,
+                name,
+                *collapsed,
+                *session_count,
+                *counts,
+            )),
+            DashboardRow::Session {
+                session,
+                last_in_group,
+            } => session_row_width(session, *last_in_group, animation_frame),
+        };
+        width = width.max(row_width);
+    }
+    width
+}
+
+fn display_width(value: &str) -> u16 {
+    let width = Line::from(value).width();
+    u16::try_from(width).unwrap_or(u16::MAX)
+}
+
+fn group_header_text(group_index: usize, group: &SessionGroup) -> String {
+    group_header_row_text(
+        group_index,
+        &group.name,
+        group.collapsed,
+        group.sessions.len(),
+        group_status_counts(group),
+    )
+}
+
+fn group_header_row_text(
+    group_index: usize,
+    group_name: &str,
+    collapsed: bool,
+    session_count: usize,
+    counts: StatusCounts,
+) -> String {
+    use std::fmt::Write as _;
+
+    let collapse_mark = if collapsed { "+" } else { "-" };
+    let mut text = format!(
+        "{}. {} ({}) {}",
+        group_index + 1,
+        group_name,
+        session_count,
+        collapse_mark
+    );
+    for (marker, count) in [
+        ("◆", counts.occupied),
+        ("✦", counts.thinking),
+        ("●", counts.running),
+        ("▸", counts.starting),
+        ("⋯", counts.queued),
+        ("◌", counts.waiting),
+        ("·", counts.idle),
+        ("■", counts.stopped),
+        ("×", counts.errored),
+    ] {
+        if count > 0 {
+            let _ = write!(text, " {marker}{count}");
+        }
+    }
+    text
+}
+
 fn mouse_on_divider(mouse: MouseEvent, area: Rect, app: &App) -> bool {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -3998,7 +4119,8 @@ fn mouse_on_divider(mouse: MouseEvent, area: Rect, app: &App) -> bool {
             Constraint::Length(1),
         ])
         .split(area);
-    let body = body_layout(chunks[1], app.sidebar_percent);
+    let view = app.view();
+    let body = body_layout_for_view(chunks[1], &view, app.sidebar_width, app.animation_frame);
 
     let hit_start = body.divider.x.saturating_sub(DIVIDER_HIT_COLUMNS);
     let hit_end = body
@@ -4017,7 +4139,8 @@ fn mouse_on_session_preview(mouse: MouseEvent, area: Rect, app: &App) -> bool {
     if !matches!(app.mode, Mode::Normal | Mode::Search) {
         return false;
     }
-    let Some(session) = app.view().selected else {
+    let view = app.view();
+    let Some(session) = view.selected.as_ref() else {
         return false;
     };
     if !session_is_live(session.status) {
@@ -4028,7 +4151,8 @@ fn mouse_on_session_preview(mouse: MouseEvent, area: Rect, app: &App) -> bool {
             width: area.width,
             height: area.height,
         },
-        app.sidebar_percent,
+        &view,
+        app.sidebar_width,
     );
     point_in_rect(mouse.column, mouse.row, preview)
 }
@@ -4042,7 +4166,8 @@ fn mouse_on_embedded_session(mouse: MouseEvent, area: Rect, app: &App) -> bool {
             width: area.width,
             height: area.height,
         },
-        app.sidebar_percent,
+        &app.view(),
+        app.sidebar_width,
     );
     point_in_rect(mouse.column, mouse.row, embedded)
 }
@@ -4054,7 +4179,7 @@ fn point_in_rect(column: u16, row: u16, area: Rect) -> bool {
         && column < area.x.saturating_add(area.width)
 }
 
-fn set_sidebar_percent_from_mouse(app: &mut App, column: u16, area: Rect) -> bool {
+fn set_sidebar_width_from_mouse(app: &mut App, column: u16, area: Rect) -> bool {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -4069,10 +4194,9 @@ fn set_sidebar_percent_from_mouse(app: &mut App, column: u16, area: Rect) -> boo
     }
 
     let relative = column.saturating_sub(body.x).min(body.width);
-    let percent =
-        (relative.saturating_mul(100) / body.width).clamp(MIN_SIDEBAR_PERCENT, MAX_SIDEBAR_PERCENT);
-    let changed = app.sidebar_percent != percent;
-    app.sidebar_percent = percent;
+    let width = clamp_sidebar_width(body, relative);
+    let changed = app.sidebar_width != Some(width);
+    app.sidebar_width = Some(width);
     changed
 }
 
@@ -4087,7 +4211,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
             Constraint::Length(1),
         ])
         .split(frame.area());
-    let body = body_layout(chunks[1], app.sidebar_percent);
+    let body = body_layout_for_view(chunks[1], &view, app.sidebar_width, app.animation_frame);
 
     frame.render_widget(header(app, &view), chunks[0]);
     let (sessions, mut session_state) = session_list(&view, app.animation_frame);
@@ -4209,23 +4333,8 @@ fn session_list(view: &DashboardView, animation_frame: usize) -> (List<'static>,
     let mut items = Vec::new();
 
     for (group_index, group) in view.groups.iter().enumerate() {
-        let counts = group_status_counts(group);
-        let collapse_mark = if group.collapsed { "+" } else { "-" };
         items.push(ListItem::new(Line::from(Span::styled(
-            format!(
-                "{}. {} ({}) {} *{} >{} :{} ?{} -{} o{} !{}",
-                group_index + 1,
-                group.name,
-                group.sessions.len(),
-                collapse_mark,
-                counts.running,
-                counts.starting,
-                counts.queued,
-                counts.waiting,
-                counts.idle,
-                counts.stopped,
-                counts.errored
-            ),
+            group_header_text(group_index, group),
             group_style(),
         ))));
 
@@ -4235,37 +4344,16 @@ fn session_list(view: &DashboardView, animation_frame: usize) -> (List<'static>,
 
         for (session_index, session) in group.sessions.iter().enumerate() {
             let selected = selected_id == Some(session.id.as_str());
-            let branch = if session_index + 1 == group.sessions.len() {
-                "`-"
-            } else {
-                "|-"
-            };
-            let mut row = vec![
-                Span::styled(branch, muted_style()),
-                Span::raw(" "),
-                Span::styled(
-                    session_activity_marker(session, animation_frame),
-                    session_activity_style(session),
+            let last_in_group = session_index + 1 == group.sessions.len();
+            items.push(
+                ListItem::new(session_row_line(session, last_in_group, animation_frame)).style(
+                    if selected {
+                        selected_row_style()
+                    } else {
+                        Style::default()
+                    },
                 ),
-                Span::raw(" "),
-                Span::raw(session.name.clone()),
-                Span::raw(if session.pr_number.is_some() { " " } else { "" }),
-                Span::styled(session_pr_label(session.pr_number), pr_style()),
-                Span::raw(" "),
-                Span::styled(session.agent.clone(), agent_style(&session.agent)),
-            ];
-            if let Some(label) = session_activity_label(session) {
-                row.push(Span::raw(" "));
-                row.push(Span::styled(
-                    label.to_string(),
-                    activity_label_style(session),
-                ));
-            }
-            items.push(ListItem::new(Line::from(row)).style(if selected {
-                selected_row_style()
-            } else {
-                Style::default()
-            }));
+            );
         }
     }
 
@@ -4283,6 +4371,41 @@ fn session_list(view: &DashboardView, animation_frame: usize) -> (List<'static>,
         .highlight_style(Style::default());
     let state = ListState::default().with_selected(selected_row);
     (list, state)
+}
+
+fn session_row_line(
+    session: &SessionSummary,
+    last_in_group: bool,
+    animation_frame: usize,
+) -> Line<'static> {
+    let branch = if last_in_group { "`-" } else { "|-" };
+    let mut row = vec![
+        Span::styled(branch, muted_style()),
+        Span::raw(" "),
+        Span::styled(
+            session_activity_marker(session, animation_frame),
+            session_activity_style(session),
+        ),
+        Span::raw(" "),
+        Span::raw(session.name.clone()),
+        Span::raw(if session.pr_number.is_some() { " " } else { "" }),
+        Span::styled(session_pr_label(session.pr_number), pr_style()),
+        Span::raw(" "),
+        Span::styled(session.agent.clone(), agent_style(&session.agent)),
+    ];
+    if let Some(label) = session_activity_label(session) {
+        row.push(Span::raw(" "));
+        row.push(Span::styled(
+            label.to_string(),
+            activity_label_style(session),
+        ));
+    }
+    Line::from(row)
+}
+
+fn session_row_width(session: &SessionSummary, last_in_group: bool, animation_frame: usize) -> u16 {
+    let width = session_row_line(session, last_in_group, animation_frame).width();
+    u16::try_from(width).unwrap_or(u16::MAX)
 }
 
 fn selected_list_row(view: &DashboardView) -> Option<usize> {
@@ -5960,7 +6083,7 @@ mod tests {
             detail_scroll: 0,
             preview_scroll: 0,
             status_filter: StatusFilter::All,
-            sidebar_percent: DEFAULT_SIDEBAR_PERCENT,
+            sidebar_width: None,
             resizing_sidebar: false,
             mouse_capture: true,
             animation_frame: 0,
@@ -6748,11 +6871,11 @@ mod tests {
     #[test]
     fn enter_opens_embedded_session_input_panel() {
         let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
-        app.sidebar_percent = 32;
+        app.sidebar_width = Some(32);
 
         focus_selected_session(&mut app);
 
-        assert_eq!(app.sidebar_percent, 32);
+        assert_eq!(app.sidebar_width, Some(32));
         assert_eq!(app.detail_scroll, 0);
         assert!(matches!(app.mode, Mode::Session(_)));
         assert_eq!(app.status_message, None);
@@ -7548,7 +7671,13 @@ mod tests {
         };
         let expected_cursor = new_form_cursor_position(
             form,
-            body_layout(Rect::new(0, 4, 100, 13), app.sidebar_percent).detail,
+            body_layout_for_view(
+                Rect::new(0, 4, 100, 13),
+                &app.view(),
+                app.sidebar_width,
+                app.animation_frame,
+            )
+            .detail,
         )
         .unwrap();
         let cursor = terminal.backend().cursor_position();
@@ -7614,7 +7743,8 @@ mod tests {
                 width: 100,
                 height: 18,
             },
-            app.sidebar_percent,
+            &app.view(),
+            app.sidebar_width,
         );
         let target = tmux_session_name_for_id("1");
         app.preview = Some(TerminalPreview {
@@ -7800,7 +7930,8 @@ mod tests {
                 width: 100,
                 height: 18,
             },
-            app.sidebar_percent,
+            &app.view(),
+            app.sidebar_width,
         );
         let border_cell = terminal
             .backend()
@@ -8185,34 +8316,88 @@ mod tests {
     }
 
     #[test]
-    fn body_layout_uses_smaller_default_sidebar_and_divider() {
-        assert_eq!(DEFAULT_SIDEBAR_PERCENT, 24);
+    fn body_layout_auto_sizes_sidebar_to_visible_text() {
+        let mut session = record("1", "ops", "build", false);
+        session.agent = "codex".to_string();
+        session.project_path = "/tmp/pr-42".to_string();
+        let deck_statuses = BTreeMap::from([(
+            "1".to_string(),
+            TuiSessionStatus {
+                deck_status: SessionDeckStatus::Occupied,
+                activity: Some(SessionActivity {
+                    state: "occupied".to_string(),
+                    label: "editing".to_string(),
+                    source: "agent".to_string(),
+                    tool: None,
+                }),
+            },
+        )]);
+        let view = DashboardView::build_with_statuses(
+            &[session],
+            &deck_statuses,
+            &BTreeSet::new(),
+            "",
+            0,
+            StatusFilter::All,
+        );
+        let layout = body_layout_for_view(Rect::new(0, 4, 100, 20), &view, None, 0);
+        let expected_width = display_width("`- ◆ build #42 codex editing") + SIDEBAR_LIST_PADDING;
 
-        let layout = body_layout(Rect::new(0, 4, 100, 20), DEFAULT_SIDEBAR_PERCENT);
-
-        assert_eq!(layout.sidebar.width, 24);
-        assert_eq!(layout.divider.x, 24);
+        assert_eq!(layout.sidebar.width, expected_width);
+        assert_eq!(layout.divider.x, layout.sidebar.width);
         assert_eq!(layout.divider.width, 1);
-        assert_eq!(layout.detail.x, 25);
+        assert_eq!(layout.detail.x, layout.sidebar.width + 1);
+    }
+
+    #[test]
+    fn body_layout_auto_size_grows_and_clamps() {
+        let sessions = vec![record(
+            "1",
+            "operations-with-a-long-visible-group",
+            "deploy-with-a-long-visible-session-name",
+            false,
+        )];
+        let view = DashboardView::build(&sessions, "", 0, StatusFilter::All);
+        let layout = body_layout_for_view(Rect::new(0, 4, 100, 20), &view, None, 0);
+
+        assert_eq!(layout.sidebar.width, 50);
+        assert_eq!(layout.detail.x, 51);
+    }
+
+    #[test]
+    fn group_header_text_omits_zero_status_counts() {
+        let mut occupied = SessionSummary::from(&record("1", "ops", "deploy", false));
+        occupied.deck_status = SessionDeckStatus::Occupied;
+        let mut idle = SessionSummary::from(&record("2", "ops", "shell", false));
+        idle.deck_status = SessionDeckStatus::Idle;
+        let group = SessionGroup {
+            name: "ops".to_string(),
+            collapsed: false,
+            sessions: vec![occupied, idle],
+        };
+
+        assert_eq!(group_header_text(0, &group), "1. ops (2) - ◆1 ·1");
     }
 
     #[test]
     fn mouse_drag_resizes_sidebar_from_divider() {
         let area = Rect::new(0, 0, 100, 20);
         let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
+        let body =
+            body_layout_for_view(Rect::new(0, 4, 100, 15), &app.view(), app.sidebar_width, 0);
 
         let changed = process_mouse(
             &mut app,
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
-                column: 24,
+                column: body.divider.x,
                 row: 5,
                 modifiers: KeyModifiers::NONE,
             },
             area,
         );
 
-        assert!(!changed);
+        assert!(changed);
         assert!(app.resizing_sidebar);
 
         let changed = process_mouse(
@@ -8227,7 +8412,24 @@ mod tests {
         );
 
         assert!(changed);
-        assert_eq!(app.sidebar_percent, 40);
+        assert_eq!(app.sidebar_width, Some(40));
+        let resized_body =
+            body_layout_for_view(Rect::new(0, 4, 100, 15), &app.view(), app.sidebar_width, 0);
+        assert_eq!(resized_body.sidebar.width, 40);
+        assert_eq!(resized_body.divider.x, 40);
+        assert_eq!(resized_body.detail.x, 41);
+        let size = ratatui::layout::Size {
+            width: area.width,
+            height: area.height,
+        };
+        assert_eq!(
+            terminal_preview_area(size, &app.view(), app.sidebar_width).x,
+            resized_body.detail.x + 1
+        );
+        assert_eq!(
+            embedded_terminal_area(size, &app.view(), app.sidebar_width).x,
+            resized_body.detail.x + 1
+        );
 
         let changed = process_mouse(
             &mut app,
@@ -8262,7 +8464,7 @@ mod tests {
 
         assert!(!changed);
         assert!(!app.resizing_sidebar);
-        assert_eq!(app.sidebar_percent, DEFAULT_SIDEBAR_PERCENT);
+        assert_eq!(app.sidebar_width, None);
     }
 
     #[test]
@@ -8316,7 +8518,8 @@ mod tests {
                 width: area.width,
                 height: area.height,
             },
-            app.sidebar_percent,
+            &app.view(),
+            app.sidebar_width,
         );
 
         let changed = process_mouse(
@@ -8523,7 +8726,7 @@ mod tests {
             detail_scroll: 0,
             preview_scroll: 0,
             status_filter: StatusFilter::All,
-            sidebar_percent: DEFAULT_SIDEBAR_PERCENT,
+            sidebar_width: None,
             resizing_sidebar: false,
             mouse_capture: true,
             animation_frame: 0,
