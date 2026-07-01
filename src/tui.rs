@@ -8,8 +8,8 @@ use crate::{
 };
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-        MouseButton, MouseEvent, MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{
@@ -54,14 +54,13 @@ const DETAILS_REFRESH_DEBOUNCE: Duration = Duration::from_millis(125);
 const PREVIEW_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const PREVIEW_SCROLL_LINES: u16 = 1;
 const PREVIEW_MAX_SCROLL_LINES: u16 = 5000;
-const EMBEDDED_SCROLL_LINES: usize = 1;
 const EMBED_READ_BUF_SIZE: usize = 8192;
 const EMBED_MIN_ROWS: u16 = 2;
 const EMBED_MIN_COLS: u16 = 10;
-#[cfg(test)]
 const SGR_MOUSE_WHEEL_UP: u8 = 64;
-#[cfg(test)]
 const SGR_MOUSE_WHEEL_DOWN: u8 = 65;
+const SGR_MOUSE_LEFT: u8 = 0;
+const SGR_MOUSE_DRAG: u8 = 32;
 const MIN_SIDEBAR_WIDTH: u16 = 8;
 const MAX_SIDEBAR_PERCENT: u16 = 50;
 const SIDEBAR_LIST_PADDING: u16 = 4;
@@ -709,6 +708,7 @@ struct App {
     status_filter: StatusFilter,
     sidebar_width: Option<u16>,
     resizing_sidebar: bool,
+    embedded_mouse_drag: bool,
     mouse_capture: bool,
     animation_frame: usize,
     last_agent: String,
@@ -755,6 +755,7 @@ fn app_from_initial(initial: TuiInitialState) -> App {
         status_filter: StatusFilter::All,
         sidebar_width: None,
         resizing_sidebar: false,
+        embedded_mouse_drag: false,
         mouse_capture: true,
         animation_frame: 0,
         last_agent: default_agent,
@@ -2314,16 +2315,6 @@ fn apply_group_default_settings(
     form.carry_state = group.default_carry_state.unwrap_or(false);
 }
 
-fn group_default_path<'a>(
-    group_default_paths: &'a BTreeMap<String, String>,
-    group_name: &str,
-) -> Option<&'a str> {
-    group_default_paths
-        .get(group_name)
-        .map(String::as_str)
-        .filter(|path| !path.is_empty())
-}
-
 fn group_names(group_default_paths: &BTreeMap<String, String>) -> Vec<String> {
     group_default_paths.keys().cloned().collect()
 }
@@ -2374,17 +2365,6 @@ fn cycle_move_group_name(
         return;
     }
     cycle_group_name(group_name, group_default_paths, delta);
-}
-
-fn apply_group_default_path(
-    form: &mut NewForm,
-    group_default_paths: &BTreeMap<String, String>,
-) -> bool {
-    let Some(path) = group_default_path(group_default_paths, &form.group_name) else {
-        return false;
-    };
-    form.path = path.to_string();
-    true
 }
 
 fn normalized_agent(agent: &str) -> String {
@@ -3108,6 +3088,10 @@ where
     F: FnMut(TuiAction) -> Result<Vec<SessionRecord>>,
     G: FnMut(BackgroundActionRequest),
 {
+    if matches!(key.kind, KeyEventKind::Release) {
+        return Ok(false);
+    }
+
     if matches!(app.mode, Mode::Normal | Mode::Search) && is_plain_ctrl_key(key, 't') {
         toggle_mouse_capture(app);
         return Ok(false);
@@ -3181,7 +3165,7 @@ fn is_plain_char_key(key: KeyEvent, ch: char) -> bool {
 fn toggle_mouse_capture(app: &mut App) {
     app.mouse_capture = !app.mouse_capture;
     app.status_message = Some(if app.mouse_capture {
-        "mouse wheel scrolling enabled".to_string()
+        "tmux mouse selection enabled".to_string()
     } else {
         "terminal text selection enabled".to_string()
     });
@@ -3210,11 +3194,24 @@ fn set_new_form_launching(app: &mut App, launching: bool) {
 
 fn process_mouse(app: &mut App, mouse: MouseEvent, area: Rect) -> bool {
     match mouse.kind {
-        MouseEventKind::ScrollUp if mouse_on_embedded_session(mouse, area, app) => {
-            scroll_embedded_session(app, mouse, area)
+        MouseEventKind::Drag(MouseButton::Left) if app.resizing_sidebar => {
+            set_sidebar_width_from_mouse(app, mouse.column, area)
         }
-        MouseEventKind::ScrollDown if mouse_on_embedded_session(mouse, area, app) => {
-            scroll_embedded_session(app, mouse, area)
+        MouseEventKind::Up(MouseButton::Left) if app.resizing_sidebar => {
+            app.resizing_sidebar = false;
+            true
+        }
+        MouseEventKind::Down(MouseButton::Left)
+        | MouseEventKind::Drag(MouseButton::Left)
+        | MouseEventKind::Up(MouseButton::Left)
+            if embedded_mouse_event_targets_session(app, mouse, area) =>
+        {
+            forward_embedded_mouse_event(app, mouse, area)
+        }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            if mouse_on_embedded_session(mouse, area, app) =>
+        {
+            forward_embedded_mouse_event(app, mouse, area)
         }
         MouseEventKind::ScrollUp if mouse_on_session_preview(mouse, area, app) => {
             scroll_session_preview(app, PREVIEW_SCROLL_LINES as i16)
@@ -3226,19 +3223,25 @@ fn process_mouse(app: &mut App, mouse: MouseEvent, area: Rect) -> bool {
             app.resizing_sidebar = true;
             set_sidebar_width_from_mouse(app, mouse.column, area)
         }
-        MouseEventKind::Drag(MouseButton::Left) if app.resizing_sidebar => {
-            set_sidebar_width_from_mouse(app, mouse.column, area)
-        }
         MouseEventKind::Up(MouseButton::Left) => {
-            let was_resizing = app.resizing_sidebar;
-            app.resizing_sidebar = false;
-            was_resizing
+            app.embedded_mouse_drag = false;
+            false
         }
         _ => false,
     }
 }
 
-fn scroll_embedded_session(app: &mut App, mouse: MouseEvent, area: Rect) -> bool {
+fn embedded_mouse_event_targets_session(app: &App, mouse: MouseEvent, area: Rect) -> bool {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => mouse_on_embedded_session(mouse, area, app),
+        MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
+            app.embedded_mouse_drag
+        }
+        _ => false,
+    }
+}
+
+fn forward_embedded_mouse_event(app: &mut App, mouse: MouseEvent, area: Rect) -> bool {
     let terminal_area = embedded_terminal_area(
         ratatui::layout::Size {
             width: area.width,
@@ -3247,92 +3250,75 @@ fn scroll_embedded_session(app: &mut App, mouse: MouseEvent, area: Rect) -> bool
         &app.view(),
         app.sidebar_width,
     );
-    if !point_in_rect(mouse.column, mouse.row, terminal_area) {
+    let clamp_to_area = app.embedded_mouse_drag;
+    let Some(bytes) = encode_embedded_mouse_event(mouse, terminal_area, clamp_to_area) else {
         return false;
     };
-    let direction = match mouse.kind {
-        MouseEventKind::ScrollUp => TmuxScrollDirection::Up,
-        MouseEventKind::ScrollDown => TmuxScrollDirection::Down,
-        _ => return false,
-    };
-    let Some(target) = app
-        .embedded
-        .as_ref()
-        .map(|embedded| embedded.target.clone())
-    else {
+    let Some(embedded) = app.embedded.as_mut() else {
+        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+            app.embedded_mouse_drag = false;
+        }
         return false;
     };
-
-    match scroll_tmux_history(&target, direction) {
+    match embedded.write_bytes(&bytes) {
         Ok(()) => {
-            if let Some(embedded) = app.embedded.as_mut() {
-                embedded.drain();
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                app.embedded_mouse_drag = true;
+            }
+            if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+                app.embedded_mouse_drag = false;
             }
             true
         }
         Err(err) => {
-            app.status_message = Some(format!("scroll failed: {err}"));
+            if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+                app.embedded_mouse_drag = false;
+            }
+            app.status_message = Some(format!("mouse failed: {err}"));
             false
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum TmuxScrollDirection {
-    Up,
-    Down,
-}
-
-fn scroll_tmux_history(target: &str, direction: TmuxScrollDirection) -> Result<()> {
-    if matches!(direction, TmuxScrollDirection::Up) {
-        let status = Command::new("tmux")
-            .arg("copy-mode")
-            .arg("-e")
-            .arg("-t")
-            .arg(target)
-            .status()
-            .map_err(|err| AppError::msg(format!("enter tmux copy mode: {err}")))?;
-        if !status.success() {
-            return Err(AppError::msg(format!("enter tmux copy mode: {status}")));
-        }
-    }
-
-    let command = match direction {
-        TmuxScrollDirection::Up => "scroll-up",
-        TmuxScrollDirection::Down => "scroll-down",
-    };
-    for _ in 0..EMBEDDED_SCROLL_LINES {
-        let status = Command::new("tmux")
-            .arg("send-keys")
-            .arg("-t")
-            .arg(target)
-            .arg("-X")
-            .arg(command)
-            .status()
-            .map_err(|err| AppError::msg(format!("scroll tmux history: {err}")))?;
-        if !status.success() {
-            if matches!(direction, TmuxScrollDirection::Down) {
-                return Ok(());
-            }
-            return Err(AppError::msg(format!("scroll tmux history: {status}")));
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 fn encode_embedded_mouse_wheel(mouse: MouseEvent, area: Rect) -> Option<Vec<u8>> {
-    if !point_in_rect(mouse.column, mouse.row, area) {
+    encode_embedded_mouse_event(mouse, area, false)
+}
+
+fn encode_embedded_mouse_event(
+    mouse: MouseEvent,
+    area: Rect,
+    clamp_to_area: bool,
+) -> Option<Vec<u8>> {
+    if area.width == 0 || area.height == 0 {
         return None;
     }
-    let button = match mouse.kind {
-        MouseEventKind::ScrollUp => SGR_MOUSE_WHEEL_UP,
-        MouseEventKind::ScrollDown => SGR_MOUSE_WHEEL_DOWN,
+    let (column, row) = if clamp_to_area {
+        (
+            mouse
+                .column
+                .clamp(area.x, area.x.saturating_add(area.width.saturating_sub(1))),
+            mouse
+                .row
+                .clamp(area.y, area.y.saturating_add(area.height.saturating_sub(1))),
+        )
+    } else {
+        if !point_in_rect(mouse.column, mouse.row, area) {
+            return None;
+        }
+        (mouse.column, mouse.row)
+    };
+    let (button, terminator) = match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => (SGR_MOUSE_LEFT, 'M'),
+        MouseEventKind::Drag(MouseButton::Left) => (SGR_MOUSE_LEFT | SGR_MOUSE_DRAG, 'M'),
+        MouseEventKind::Up(MouseButton::Left) => (SGR_MOUSE_LEFT, 'm'),
+        MouseEventKind::ScrollUp => (SGR_MOUSE_WHEEL_UP, 'M'),
+        MouseEventKind::ScrollDown => (SGR_MOUSE_WHEEL_DOWN, 'M'),
         _ => return None,
     };
-    let column = mouse.column - area.x + 1;
-    let row = mouse.row - area.y + 1;
-    Some(format!("\x1b[<{button};{column};{row}M").into_bytes())
+    let column = column - area.x + 1;
+    let row = row - area.y + 1;
+    Some(format!("\x1b[<{button};{column};{row}{terminator}").into_bytes())
 }
 
 fn scroll_session_preview(app: &mut App, delta: i16) -> bool {
@@ -3875,30 +3861,22 @@ where
     let group_default_paths = app.group_default_paths.clone();
     let group_defaults = app.group_defaults.clone();
 
+    let mut exit_new = false;
     if let Mode::New(form) = &mut app.mode {
+        let group_before_key = form.group_name.clone();
         match key.code {
-            KeyCode::Esc => app.mode = Mode::Normal,
+            KeyCode::Esc => exit_new = true,
             KeyCode::Tab | KeyCode::Down => {
-                let apply_group_path = form.current_field() == NewField::Group;
                 form.next_field();
-                if apply_group_path {
-                    apply_group_defaults_from_maps(form, &group_defaults, &tool_settings);
-                }
             }
             KeyCode::BackTab | KeyCode::Up => {
-                let apply_group_path = form.current_field() == NewField::Group;
                 form.previous_field();
-                if apply_group_path {
-                    apply_group_defaults_from_maps(form, &group_defaults, &tool_settings);
-                }
             }
             KeyCode::Left if form.current_field() == NewField::Group => {
                 cycle_group_name(&mut form.group_name, &group_default_paths, -1);
-                apply_group_defaults_from_maps(form, &group_defaults, &tool_settings);
             }
             KeyCode::Right if form.current_field() == NewField::Group => {
                 cycle_group_name(&mut form.group_name, &group_default_paths, 1);
-                apply_group_defaults_from_maps(form, &group_defaults, &tool_settings);
             }
             KeyCode::Left if form.current_field() == NewField::Agent => {
                 form.cycle_agent(&agent_choices, -1);
@@ -3909,14 +3887,10 @@ where
                 form.worktree = tool_creates_worktree_by_default(&tool_settings, &form.agent);
             }
             KeyCode::Enter => {
-                let apply_group_path = form.current_field() == NewField::Group;
                 if form.field_index == NEW_FIELDS.len() - 1 {
                     submit = true;
                 } else {
                     form.next_field();
-                }
-                if apply_group_path {
-                    apply_group_default_path(form, &group_default_paths);
                 }
             }
             KeyCode::Backspace => {
@@ -3925,14 +3899,10 @@ where
                 }
             }
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if form.current_field() == NewField::Group {
-                    apply_group_default_path(form, &group_default_paths);
-                }
                 submit = true;
             }
             KeyCode::Char(' ') if form.current_field() == NewField::Group => {
                 cycle_group_name(&mut form.group_name, &group_default_paths, 1);
-                apply_group_default_path(form, &group_default_paths);
             }
             KeyCode::Char(' ') if form.current_field() == NewField::Agent => {
                 form.cycle_agent(&agent_choices, 1);
@@ -3951,6 +3921,13 @@ where
             }
             _ => {}
         }
+        if form.group_name != group_before_key {
+            apply_group_defaults_from_maps(form, &group_defaults, &tool_settings);
+        }
+    }
+
+    if exit_new {
+        app.mode = Mode::Normal;
     }
 
     if submit {
@@ -6261,9 +6238,9 @@ fn footer_text(app: &App) -> String {
         Mode::Fork(_) => "Fork: Tab field | Enter next/fork | Ctrl-S fork | Esc cancel".to_string(),
         Mode::Session(_) => {
             if app.mouse_capture {
-                "Session: wheel scroll mode | Ctrl-[ previous Ctrl-] next | Ctrl-q dashboard | Ctrl-t text selection".to_string()
+                "Session: tmux mouse selection | Ctrl-[ previous Ctrl-] next | Ctrl-q dashboard | Ctrl-t terminal selection".to_string()
             } else {
-                "Session: text selection mode | Ctrl-[ previous Ctrl-] next | Ctrl-q dashboard | Ctrl-t wheel scroll".to_string()
+                "Session: terminal selection | Ctrl-[ previous Ctrl-] next | Ctrl-q dashboard | Ctrl-t tmux mouse".to_string()
             }
         }
         Mode::Move(_) => {
@@ -6902,6 +6879,7 @@ mod tests {
             status_filter: StatusFilter::All,
             sidebar_width: None,
             resizing_sidebar: false,
+            embedded_mouse_drag: false,
             mouse_capture: true,
             animation_frame: 0,
             last_agent: "shell".to_string(),
@@ -7292,20 +7270,32 @@ mod tests {
     }
 
     #[test]
-    fn new_form_applies_group_path_when_leaving_group_field() {
-        let mut app = test_app(vec![]);
-        app.group_default_paths
-            .insert("work/api".to_string(), "/tmp/api".to_string());
+    fn new_form_preserves_values_when_leaving_unchanged_group_field() {
+        let mut group = group_record("work/api", "/tmp/api", false);
+        group.default_agent = Some("codex".to_string());
+        group.default_worktree = Some(true);
+        group.default_carry_state = Some(true);
+        let mut app = app_from_initial(TuiInitialState {
+            sessions: vec![],
+            groups: vec![group],
+            default_agent: "shell".to_string(),
+            headroom_metrics: None,
+            agent_choices: default_agent_choices(),
+            tool_settings: normalize_tool_settings(Vec::new()),
+        });
         app.mode = Mode::New(NewForm {
             path: "/tmp/original".to_string(),
+            agent: "shell".to_string(),
             group_name: "work/api".to_string(),
+            worktree: false,
+            carry_state: false,
             field_index: 3,
             ..NewForm::default()
         });
         let mut handle = |_action| Ok(Vec::new());
 
         handle_new_key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
             &mut app,
             &mut handle,
         )
@@ -7314,7 +7304,10 @@ mod tests {
         let Mode::New(form) = &app.mode else {
             panic!("expected new form");
         };
-        assert_eq!(form.path, "/tmp/api");
+        assert_eq!(form.path, "/tmp/original");
+        assert_eq!(form.agent, "shell");
+        assert!(!form.worktree);
+        assert!(!form.carry_state);
         assert_eq!(form.current_field(), NewField::Worktree);
     }
 
@@ -7921,6 +7914,43 @@ mod tests {
         assert_eq!(request.worktree, None);
         assert_eq!(request.prompt, None);
         assert_eq!(app.status_message.as_deref(), Some("created shell session"));
+    }
+
+    #[test]
+    fn key_release_does_not_repeat_ctrl_n_create() {
+        let backend = ratatui::backend::TestBackend::new(100, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut session = record("1", "work/api", "deploy", false);
+        session.project_path = "/tmp/project".to_string();
+        let mut app = test_app(vec![session]);
+        let mut requests = Vec::new();
+        let mut handle = |_action: TuiAction| -> Result<Vec<SessionRecord>> {
+            panic!("create should remain a background action");
+        };
+
+        process_key_with_background(
+            &mut terminal,
+            &mut app,
+            &mut handle,
+            &mut |request| requests.push(request),
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        process_key_with_background(
+            &mut terminal,
+            &mut app,
+            &mut handle,
+            &mut |request| requests.push(request),
+            KeyEvent::new_with_kind(
+                KeyCode::Char('n'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Release,
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(app.pending_operations.len(), 1);
     }
 
     #[test]
@@ -8715,7 +8745,7 @@ mod tests {
         assert!(app.mouse_capture);
         assert_eq!(
             app.status_message.as_deref(),
-            Some("mouse wheel scrolling enabled")
+            Some("tmux mouse selection enabled")
         );
     }
 
@@ -8773,7 +8803,7 @@ mod tests {
         assert!(!wants_mouse_capture(&app));
         assert_eq!(
             footer_text(&app),
-            "Session: text selection mode | Ctrl-[ previous Ctrl-] next | Ctrl-q dashboard | Ctrl-t wheel scroll"
+            "Session: terminal selection | Ctrl-[ previous Ctrl-] next | Ctrl-q dashboard | Ctrl-t tmux mouse"
         );
     }
 
@@ -9707,6 +9737,114 @@ mod tests {
     }
 
     #[test]
+    fn embedded_mouse_selection_encodes_sgr_coordinates_relative_to_terminal() {
+        let area = Rect::new(10, 4, 20, 8);
+        let down = encode_embedded_mouse_event(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 12,
+                row: 7,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+            false,
+        )
+        .unwrap();
+        assert_eq!(down, b"\x1b[<0;3;4M");
+
+        let drag = encode_embedded_mouse_event(
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 13,
+                row: 8,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+            false,
+        )
+        .unwrap();
+        assert_eq!(drag, b"\x1b[<32;4;5M");
+
+        let up = encode_embedded_mouse_event(
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 13,
+                row: 8,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+            false,
+        )
+        .unwrap();
+        assert_eq!(up, b"\x1b[<0;4;5m");
+
+        let clamped_up = encode_embedded_mouse_event(
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 40,
+                row: 20,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+            true,
+        )
+        .unwrap();
+        assert_eq!(clamped_up, b"\x1b[<0;20;8m");
+    }
+
+    #[test]
+    fn embedded_mouse_drag_keeps_target_after_leaving_terminal() {
+        let area = Rect::new(0, 0, 100, 20);
+        let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
+        app.mode = Mode::Session(SendForm::default());
+        app.embedded_mouse_drag = true;
+
+        assert!(embedded_mouse_event_targets_session(
+            &app,
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        ));
+        assert!(embedded_mouse_event_targets_session(
+            &app,
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        ));
+        assert!(!embedded_mouse_event_targets_session(
+            &app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        ));
+
+        let changed = process_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        );
+        assert!(!changed);
+        assert!(!app.embedded_mouse_drag);
+    }
+
+    #[test]
     fn mouse_wheel_scrolls_running_session_preview() {
         let area = Rect::new(0, 0, 100, 20);
         let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
@@ -9927,6 +10065,7 @@ mod tests {
             status_filter: StatusFilter::All,
             sidebar_width: None,
             resizing_sidebar: false,
+            embedded_mouse_drag: false,
             mouse_capture: true,
             animation_frame: 0,
             last_agent: "shell".to_string(),
