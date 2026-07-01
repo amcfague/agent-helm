@@ -4276,6 +4276,14 @@ fn handle_session_key(key: KeyEvent, app: &mut App) -> Result<()> {
         app.status_message = Some("returned to dashboard".to_string());
         return Ok(());
     }
+    if is_plain_ctrl_key(key, '[') {
+        move_focused_session(app, SessionMove::Previous);
+        return Ok(());
+    }
+    if is_plain_ctrl_key(key, ']') {
+        move_focused_session(app, SessionMove::Next);
+        return Ok(());
+    }
     if is_plain_ctrl_key(key, 't') {
         toggle_mouse_capture(app);
         return Ok(());
@@ -4285,6 +4293,34 @@ fn handle_session_key(key: KeyEvent, app: &mut App) -> Result<()> {
         embedded.write_key(key)?;
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionMove {
+    Previous,
+    Next,
+}
+
+fn move_focused_session(app: &mut App, direction: SessionMove) {
+    let view = app.view();
+    if view.visible_count == 0 {
+        app.status_message = Some("no session selected".to_string());
+        return;
+    }
+
+    let previous = app.selected_index;
+    app.selected_index = match direction {
+        SessionMove::Previous => app.selected_index.saturating_sub(1),
+        SessionMove::Next => app
+            .selected_index
+            .saturating_add(1)
+            .min(view.visible_count.saturating_sub(1)),
+    };
+    if app.selected_index != previous {
+        app.embedded = None;
+        reset_detail_view(app);
+        app.status_message = None;
+    }
 }
 
 fn handle_move_key<F>(key: KeyEvent, app: &mut App, handle_action: &mut F) -> Result<()>
@@ -6138,9 +6174,9 @@ fn footer_text(app: &App) -> String {
         Mode::Fork(_) => "Fork: Tab field | Enter next/fork | Ctrl-S fork | Esc cancel".to_string(),
         Mode::Session(_) => {
             if app.mouse_capture {
-                "Session: wheel scroll mode | Ctrl-q dashboard | Ctrl-t text selection".to_string()
+                "Session: wheel scroll mode | Ctrl-[ previous Ctrl-] next | Ctrl-q dashboard | Ctrl-t text selection".to_string()
             } else {
-                "Session: text selection mode | Ctrl-q dashboard | Ctrl-t wheel scroll".to_string()
+                "Session: text selection mode | Ctrl-[ previous Ctrl-] next | Ctrl-q dashboard | Ctrl-t wheel scroll".to_string()
             }
         }
         Mode::Move(_) => "Move: type group | Enter move | Esc cancel".to_string(),
@@ -8519,6 +8555,37 @@ mod tests {
     }
 
     #[test]
+    fn session_mode_ctrl_brackets_switch_sessions_in_place() {
+        let mut app = test_app(vec![
+            record("1", "ops", "alpha", false),
+            record("2", "ops", "beta", false),
+            record("3", "ops", "gamma", false),
+        ]);
+        app.mode = Mode::Session(SendForm::default());
+        app.selected_index = 1;
+        app.detail_scroll = 5;
+        app.status_message = Some("old".to_string());
+
+        handle_session_key(
+            KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .unwrap();
+        assert!(matches!(app.mode, Mode::Session(_)));
+        assert_eq!(app.view().selected.unwrap().id, "3");
+        assert_eq!(app.detail_scroll, 0);
+        assert_eq!(app.status_message, None);
+
+        handle_session_key(
+            KeyEvent::new(KeyCode::Char('['), KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .unwrap();
+        assert!(matches!(app.mode, Mode::Session(_)));
+        assert_eq!(app.view().selected.unwrap().id, "2");
+    }
+
+    #[test]
     fn focused_session_defaults_to_mouse_scrolling() {
         let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
 
@@ -8541,7 +8608,7 @@ mod tests {
         assert!(!wants_mouse_capture(&app));
         assert_eq!(
             footer_text(&app),
-            "Session: text selection mode | Ctrl-q dashboard | Ctrl-t wheel scroll"
+            "Session: text selection mode | Ctrl-[ previous Ctrl-] next | Ctrl-q dashboard | Ctrl-t wheel scroll"
         );
     }
 
