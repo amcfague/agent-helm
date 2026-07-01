@@ -2357,6 +2357,25 @@ fn cycle_group_name(
     *group_name = group_default_paths.keys().nth(next).unwrap().clone();
 }
 
+fn cycle_move_group_name(
+    group_name: &mut String,
+    group_default_paths: &BTreeMap<String, String>,
+    delta: isize,
+) {
+    if group_default_paths.is_empty() {
+        return;
+    }
+    if !group_default_paths.contains_key(group_name.as_str()) {
+        *group_name = if delta < 0 {
+            group_default_paths.keys().next_back().unwrap().clone()
+        } else {
+            group_default_paths.keys().next().unwrap().clone()
+        };
+        return;
+    }
+    cycle_group_name(group_name, group_default_paths, delta);
+}
+
 fn apply_group_default_path(
     form: &mut NewForm,
     group_default_paths: &BTreeMap<String, String>,
@@ -4328,10 +4347,17 @@ where
     F: FnMut(TuiAction) -> Result<Vec<SessionRecord>>,
 {
     let mut submit = false;
+    let group_default_paths = app.group_default_paths.clone();
     if let Mode::Move(form) = &mut app.mode {
         match key.code {
             KeyCode::Esc => app.mode = Mode::Normal,
             KeyCode::Enter => submit = true,
+            KeyCode::Tab | KeyCode::Down | KeyCode::Right => {
+                cycle_move_group_name(&mut form.group_name, &group_default_paths, 1);
+            }
+            KeyCode::BackTab | KeyCode::Up | KeyCode::Left => {
+                cycle_move_group_name(&mut form.group_name, &group_default_paths, -1);
+            }
             KeyCode::Backspace => {
                 form.group_name.pop();
             }
@@ -4350,8 +4376,36 @@ where
             return Ok(());
         }
         if !app.group_default_paths.contains_key(&group_name) {
-            app.status_message = Some("group must already exist".to_string());
-            return Ok(());
+            let default_project_path = app
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .map(|session| session.project_path.clone())
+                .unwrap_or_default();
+            match handle_action(TuiAction::CreateGroup {
+                name: group_name.clone(),
+                default_project_path: default_project_path.clone(),
+            }) {
+                Ok(sessions) => {
+                    app.sessions = sessions;
+                    app.group_default_paths
+                        .insert(group_name.clone(), default_project_path.clone());
+                    app.group_defaults.insert(
+                        group_name.clone(),
+                        GroupDefaults {
+                            name: group_name.clone(),
+                            default_project_path,
+                            default_agent: None,
+                            default_worktree: None,
+                            default_carry_state: None,
+                        },
+                    );
+                }
+                Err(err) => {
+                    app.status_message = Some(format!("create group failed: {err}"));
+                    return Ok(());
+                }
+            }
         }
 
         match handle_action(TuiAction::MoveToGroup {
@@ -4961,7 +5015,10 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         ),
         Mode::Fork(form) => frame.render_widget(fork_form(form, &app.status_message), body.detail),
         Mode::Session(_) => render_session_terminal(frame, app, &view, body.detail),
-        Mode::Move(form) => frame.render_widget(move_form(form, &app.status_message), body.detail),
+        Mode::Move(form) => frame.render_widget(
+            move_form(form, &app.group_default_paths, &app.status_message),
+            body.detail,
+        ),
         Mode::Rename(form) => {
             frame.render_widget(rename_form(form, &app.status_message), body.detail)
         }
@@ -6118,12 +6175,42 @@ fn fork_form(form: &ForkForm, status_message: &Option<String>) -> Paragraph<'sta
         .wrap(Wrap { trim: false })
 }
 
-fn move_form(form: &MoveForm, status_message: &Option<String>) -> Paragraph<'static> {
-    let mut lines = vec![Line::from(vec![
+fn move_form(
+    form: &MoveForm,
+    group_default_paths: &BTreeMap<String, String>,
+    status_message: &Option<String>,
+) -> Paragraph<'static> {
+    let group_name = form.group_name.trim();
+    let mut group_line = vec![
         Span::styled(">", title_style()),
         Span::raw(" Group "),
         Span::raw(form.group_name.clone()),
-    ])];
+    ];
+    if !group_name.is_empty() && !group_default_paths.contains_key(group_name) {
+        group_line.push(Span::styled(" (new)", muted_style()));
+    }
+
+    let mut lines = vec![Line::from(group_line), Line::from("")];
+    lines.push(Line::from(Span::styled("Existing groups", muted_style())));
+    if group_default_paths.is_empty() {
+        lines.push(Line::from(Span::styled("  none", muted_style())));
+    } else {
+        for name in group_default_paths.keys() {
+            let selected = name == group_name;
+            lines.push(Line::from(vec![
+                Span::styled(if selected { ">" } else { " " }, muted_style()),
+                Span::raw(" "),
+                Span::styled(
+                    name.clone(),
+                    if selected {
+                        accent_style().add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    },
+                ),
+            ]));
+        }
+    }
     if let Some(message) = status_message {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -6179,7 +6266,9 @@ fn footer_text(app: &App) -> String {
                 "Session: text selection mode | Ctrl-[ previous Ctrl-] next | Ctrl-q dashboard | Ctrl-t wheel scroll".to_string()
             }
         }
-        Mode::Move(_) => "Move: type group | Enter move | Esc cancel".to_string(),
+        Mode::Move(_) => {
+            "Move: type new group | Tab/Arrows select group | Enter move | Esc cancel".to_string()
+        }
         Mode::Rename(_) => "Rename: type name | Enter rename | Esc cancel".to_string(),
         Mode::ToolSettings(_) => {
             "Profile tools: Tab field | Left/Right cycle | Space toggle | Ctrl-S save | Esc cancel".to_string()
@@ -7883,6 +7972,59 @@ mod tests {
     }
 
     #[test]
+    fn move_form_cycles_existing_groups() {
+        let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
+        app.group_default_paths
+            .insert("core".to_string(), String::new());
+        app.group_default_paths
+            .insert("ops".to_string(), String::new());
+        app.group_default_paths
+            .insert("qa".to_string(), String::new());
+        app.mode = Mode::Move(MoveForm {
+            session_id: "1".to_string(),
+            group_name: "core".to_string(),
+        });
+        let mut handle = |_action| Ok(Vec::new());
+
+        handle_move_key(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            &mut app,
+            &mut handle,
+        )
+        .unwrap();
+        let Mode::Move(form) = &app.mode else {
+            panic!("expected move form");
+        };
+        assert_eq!(form.group_name, "ops");
+
+        handle_move_key(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            &mut app,
+            &mut handle,
+        )
+        .unwrap();
+        let Mode::Move(form) = &app.mode else {
+            panic!("expected move form");
+        };
+        assert_eq!(form.group_name, "core");
+
+        let Mode::Move(form) = &mut app.mode else {
+            panic!("expected move form");
+        };
+        form.group_name = "missing".to_string();
+        handle_move_key(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            &mut app,
+            &mut handle,
+        )
+        .unwrap();
+        let Mode::Move(form) = &app.mode else {
+            panic!("expected move form");
+        };
+        assert_eq!(form.group_name, "core");
+    }
+
+    #[test]
     fn rename_key_prefills_selected_session_name() {
         let mut app = test_app(vec![record("1", "work/api", "deploy", false)]);
         let mut handle = |_action| Ok(Vec::new());
@@ -7994,16 +8136,29 @@ mod tests {
     }
 
     #[test]
-    fn move_form_rejects_unknown_group() {
-        let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
+    fn move_form_creates_unknown_group_before_move() {
+        let mut session = record("1", "ops", "deploy", false);
+        session.project_path = "/tmp/project".to_string();
+        let mut app = test_app(vec![session]);
         app.mode = Mode::Move(MoveForm {
             session_id: "1".to_string(),
             group_name: "missing".to_string(),
         });
-        let mut actions = 0;
-        let mut handle = |_action| {
-            actions += 1;
-            Ok(Vec::new())
+        let refreshed = vec![record("1", "missing", "deploy", false)];
+        let mut actions = Vec::new();
+        let mut handle = |action| {
+            match action {
+                TuiAction::CreateGroup {
+                    name,
+                    default_project_path,
+                } => actions.push(format!("create:{name}:{default_project_path}")),
+                TuiAction::MoveToGroup {
+                    session_id,
+                    group_name,
+                } => actions.push(format!("move:{session_id}:{group_name}")),
+                _ => {}
+            }
+            Ok(refreshed.clone())
         };
 
         handle_move_key(
@@ -8013,12 +8168,22 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(actions, 0);
-        assert!(matches!(app.mode, Mode::Move(_)));
+        let selected = app.view().selected.unwrap();
         assert_eq!(
-            app.status_message.as_deref(),
-            Some("group must already exist")
+            actions,
+            vec![
+                "create:missing:/tmp/project".to_string(),
+                "move:1:missing".to_string()
+            ]
         );
+        assert_eq!(
+            app.group_default_paths.get("missing").map(String::as_str),
+            Some("/tmp/project")
+        );
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(selected.id, "1");
+        assert_eq!(selected.group_name, "missing");
+        assert_eq!(app.status_message.as_deref(), Some("moved session"));
     }
 
     #[test]
