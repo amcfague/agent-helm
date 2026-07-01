@@ -3,7 +3,7 @@ use crate::{
     error::{AppError, Result},
     models::{
         CreateSession, DeleteMode, ForkSessionRequest, GroupRecord, GroupSettingsUpdate,
-        SessionActivity, SessionDeckStatus, SessionRecord, SessionStatus,
+        SessionActivity, SessionDeckStatus, SessionRecord, SessionStatus, now_ts,
     },
 };
 use crossterm::{
@@ -164,6 +164,89 @@ impl From<SessionDeckStatus> for TuiSessionStatus {
             activity: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingOperationKind {
+    Create,
+    Fork,
+    Delete,
+}
+
+impl PendingOperationKind {
+    fn creates_placeholder(self) -> bool {
+        matches!(self, Self::Create | Self::Fork)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingOperationState {
+    Running,
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
+struct PendingOperation {
+    kind: PendingOperationKind,
+    session: SessionRecord,
+    state: PendingOperationState,
+    running_label: String,
+    failed_label: String,
+    failure_prefix: String,
+    success_message: String,
+    expected_name: Option<String>,
+    expected_group: Option<String>,
+    parent_session_id: Option<String>,
+    delete_selection_target: Option<String>,
+}
+
+impl PendingOperation {
+    fn session_id(&self) -> &str {
+        &self.session.id
+    }
+
+    fn status(&self) -> TuiSessionStatus {
+        match &self.state {
+            PendingOperationState::Running => TuiSessionStatus {
+                deck_status: SessionDeckStatus::Starting,
+                activity: Some(SessionActivity {
+                    state: "working".to_string(),
+                    label: self.running_label.clone(),
+                    source: "tui_pending".to_string(),
+                    tool: None,
+                }),
+            },
+            PendingOperationState::Failed(_) => TuiSessionStatus {
+                deck_status: SessionDeckStatus::Errored,
+                activity: Some(SessionActivity {
+                    state: "errored".to_string(),
+                    label: self.failed_label.clone(),
+                    source: "tui_pending".to_string(),
+                    tool: None,
+                }),
+            },
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        matches!(self.state, PendingOperationState::Running)
+    }
+
+    fn is_failed_placeholder(&self) -> bool {
+        self.kind.creates_placeholder() && matches!(self.state, PendingOperationState::Failed(_))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BackgroundActionRequest {
+    session_id: String,
+    action: TuiAction,
+}
+
+#[derive(Debug)]
+struct BackgroundActionResult {
+    session_id: String,
+    result: std::result::Result<Vec<SessionRecord>, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -520,7 +603,7 @@ pub fn run_tui<F, D, S>(
     mut handle_action: F,
 ) -> Result<()>
 where
-    F: FnMut(TuiAction) -> Result<Vec<SessionRecord>>,
+    F: Fn(TuiAction) -> Result<Vec<SessionRecord>> + Clone + Send + 'static,
     D: FnMut(&str) -> Result<TuiDetails>,
     S: FnMut(&[String]) -> Result<Vec<(String, TuiSessionStatus)>>,
 {
@@ -600,6 +683,9 @@ fn mouse_preview_available(app: &App) -> bool {
     if !matches!(app.mode, Mode::Normal | Mode::Search) {
         return false;
     }
+    if pending_operation_for_selected(app).is_some() {
+        return false;
+    }
     app.view()
         .selected
         .is_some_and(|session| session_is_live(session.status))
@@ -611,6 +697,8 @@ struct App {
     group_default_paths: BTreeMap<String, String>,
     group_defaults: BTreeMap<String, GroupDefaults>,
     deck_statuses: BTreeMap<String, TuiSessionStatus>,
+    pending_operations: BTreeMap<String, PendingOperation>,
+    next_pending_operation_id: u64,
     details: TuiDetails,
     details_session_id: Option<String>,
     query: String,
@@ -655,6 +743,8 @@ fn app_from_initial(initial: TuiInitialState) -> App {
         group_default_paths,
         group_defaults,
         deck_statuses: BTreeMap::new(),
+        pending_operations: BTreeMap::new(),
+        next_pending_operation_id: 1,
         details: TuiDetails::default(),
         details_session_id: None,
         query: String::new(),
@@ -700,6 +790,120 @@ impl App {
             &self.query
         }
     }
+}
+
+fn next_pending_session_id(app: &mut App) -> String {
+    let id = format!("tui-pending-{}", app.next_pending_operation_id);
+    app.next_pending_operation_id += 1;
+    id
+}
+
+fn pending_create_session(session_id: String, request: &CreateSession) -> SessionRecord {
+    let now = now_ts();
+    SessionRecord {
+        id: session_id,
+        name: request.name.clone(),
+        profile: "tui".to_string(),
+        group_name: request.group_name.clone(),
+        project_id: String::new(),
+        workspace_id: String::new(),
+        worktree_id: None,
+        parent_session_id: request.parent_session_id.clone(),
+        agent: request.agent.clone(),
+        command: request.command.clone(),
+        project_path: request.path.clone(),
+        status: SessionStatus::Starting,
+        runtime_id: None,
+        archived: false,
+        version: 0,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn pending_fork_session(
+    session_id: String,
+    request: &ForkSessionRequest,
+    parent: &SessionRecord,
+) -> SessionRecord {
+    let now = now_ts();
+    SessionRecord {
+        id: session_id,
+        name: request
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("{} fork", parent.name)),
+        profile: parent.profile.clone(),
+        group_name: request
+            .group_name
+            .clone()
+            .unwrap_or_else(|| parent.group_name.clone()),
+        project_id: parent.project_id.clone(),
+        workspace_id: parent.workspace_id.clone(),
+        worktree_id: parent.worktree_id.clone(),
+        parent_session_id: Some(parent.id.clone()),
+        agent: parent.agent.clone(),
+        command: parent.command.clone(),
+        project_path: parent.project_path.clone(),
+        status: SessionStatus::Starting,
+        runtime_id: None,
+        archived: false,
+        version: 0,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn apply_pending_statuses(app: &mut App) {
+    for operation in app.pending_operations.values() {
+        app.deck_statuses
+            .insert(operation.session_id().to_string(), operation.status());
+    }
+}
+
+fn merge_pending_sessions(app: &mut App) {
+    let pending_sessions = app
+        .pending_operations
+        .values()
+        .map(|operation| operation.session.clone())
+        .collect::<Vec<_>>();
+    for session in pending_sessions {
+        if !app
+            .sessions
+            .iter()
+            .any(|existing| existing.id == session.id)
+        {
+            app.sessions.push(session);
+        }
+    }
+    apply_pending_statuses(app);
+}
+
+fn pending_operation_for_selected(app: &App) -> Option<&PendingOperation> {
+    let session_id = selected_id(app)?;
+    app.pending_operations.get(&session_id)
+}
+
+fn block_selected_pending_operation(app: &mut App, action: &str) -> bool {
+    let Some(operation) = pending_operation_for_selected(app) else {
+        return false;
+    };
+    if operation.is_running() {
+        app.status_message = Some(format!("{action} blocked: {}", operation.running_label));
+        return true;
+    }
+    if operation.kind.creates_placeholder() {
+        app.status_message = Some("dismiss failed create with d".to_string());
+        return true;
+    }
+    false
+}
+
+fn find_session_record(app: &App, session_id: &str) -> Option<SessionRecord> {
+    app.sessions
+        .iter()
+        .find(|session| session.id == session_id)
+        .cloned()
 }
 
 struct EmbeddedTmux {
@@ -2268,10 +2472,6 @@ fn generated_session_name() -> String {
         .unwrap_or_else(|| "agent-helm-session".to_string())
 }
 
-fn project_name(path: &str) -> String {
-    crate::util::project_name(path)
-}
-
 fn auto_worktree_branch(agent: &str, name: &str, path: &str) -> String {
     crate::util::auto_worktree_branch(agent, name, path)
 }
@@ -2389,17 +2589,30 @@ fn run_app<F, D, S>(
     handle_action: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(TuiAction) -> Result<Vec<SessionRecord>>,
+    F: Fn(TuiAction) -> Result<Vec<SessionRecord>> + Clone + Send + 'static,
     D: FnMut(&str) -> Result<TuiDetails>,
     S: FnMut(&[String]) -> Result<Vec<(String, TuiSessionStatus)>>,
 {
     refresh_deck_statuses(app, load_deck_statuses)?;
     refresh_details(app, load_details, true)?;
     let preview_worker = PreviewWorker::spawn();
+    let (background_tx, background_rx) = mpsc::channel();
+    let background_action_handler = (*handle_action).clone();
+    let mut enqueue_background_action = move |request: BackgroundActionRequest| {
+        spawn_background_action_thread(
+            background_action_handler.clone(),
+            background_tx.clone(),
+            request,
+        );
+    };
     let mut tui_loop = TuiLoop::new(Instant::now());
     let mut mouse_capture_enabled = false;
     loop {
         let now = Instant::now();
+        if drain_background_action_results(app, &background_rx, handle_action)? {
+            schedule_details_refresh(app, Instant::now(), true);
+            tui_loop.mark_changed();
+        }
         sync_mouse_capture(terminal, &mut mouse_capture_enabled, app)?;
         if tui_loop.should_refresh_sessions(now) {
             refresh_sessions(app, handle_action)?;
@@ -2439,7 +2652,13 @@ where
                 }
 
                 let previous_selected_id = selected_id(app);
-                if process_key(terminal, app, handle_action, key)? {
+                if process_key_with_background(
+                    terminal,
+                    app,
+                    handle_action,
+                    &mut enqueue_background_action,
+                    key,
+                )? {
                     return Ok(());
                 }
                 schedule_details_refresh(
@@ -2461,6 +2680,161 @@ where
     }
 }
 
+fn spawn_background_action_thread<F>(
+    handle_action: F,
+    results: Sender<BackgroundActionResult>,
+    request: BackgroundActionRequest,
+) where
+    F: Fn(TuiAction) -> Result<Vec<SessionRecord>> + Send + 'static,
+{
+    thread::spawn(move || {
+        let result = handle_action(request.action).map_err(|err| err.to_string());
+        let _ = results.send(BackgroundActionResult {
+            session_id: request.session_id,
+            result,
+        });
+    });
+}
+
+fn drain_background_action_results<F>(
+    app: &mut App,
+    results: &Receiver<BackgroundActionResult>,
+    handle_action: &mut F,
+) -> Result<bool>
+where
+    F: FnMut(TuiAction) -> Result<Vec<SessionRecord>>,
+{
+    let mut changed = false;
+    while let Ok(result) = results.try_recv() {
+        changed |= apply_background_action_result(app, result, handle_action)?;
+    }
+    Ok(changed)
+}
+
+#[cfg(test)]
+fn complete_background_requests_synchronously<F>(
+    app: &mut App,
+    handle_action: &mut F,
+    requests: Vec<BackgroundActionRequest>,
+) -> Result<()>
+where
+    F: FnMut(TuiAction) -> Result<Vec<SessionRecord>>,
+{
+    for request in requests {
+        let session_id = request.session_id;
+        let result = handle_action(request.action).map_err(|err| err.to_string());
+        apply_background_action_result(
+            app,
+            BackgroundActionResult { session_id, result },
+            handle_action,
+        )?;
+    }
+    Ok(())
+}
+
+fn apply_background_action_result<F>(
+    app: &mut App,
+    result: BackgroundActionResult,
+    handle_action: &mut F,
+) -> Result<bool>
+where
+    F: FnMut(TuiAction) -> Result<Vec<SessionRecord>>,
+{
+    let Some(mut operation) = app.pending_operations.remove(&result.session_id) else {
+        return Ok(false);
+    };
+
+    match result.result {
+        Ok(sessions) => match operation.kind {
+            PendingOperationKind::Create | PendingOperationKind::Fork => {
+                let pending_id = operation.session.id.clone();
+                app.sessions.retain(|session| session.id != pending_id);
+                app.deck_statuses.remove(&pending_id);
+                app.sessions = sessions;
+                merge_pending_sessions(app);
+                if let Some(created_id) = find_created_session_id(&operation, &app.sessions) {
+                    select_matching_session(app, |session| session.id == created_id);
+                } else {
+                    select_matching_session(app, |_| false);
+                }
+                app.mode = Mode::Normal;
+                app.status_message = Some(operation.success_message);
+            }
+            PendingOperationKind::Delete => {
+                let deleted_id = operation.session.id.clone();
+                app.sessions = sessions;
+                app.deck_statuses.remove(&deleted_id);
+                invalidate_session_cache(app, &deleted_id);
+                if app.search_results_active && !app.query.trim().is_empty() {
+                    refresh_sessions(app, handle_action)?;
+                } else {
+                    merge_pending_sessions(app);
+                }
+                if let Some(target_session_id) = operation.delete_selection_target.take() {
+                    select_matching_session(app, |session| session.id == target_session_id);
+                } else {
+                    select_matching_session(app, |_| false);
+                }
+                app.status_message = Some(operation.success_message);
+            }
+        },
+        Err(message) => {
+            operation.state = PendingOperationState::Failed(message.clone());
+            app.pending_operations
+                .insert(operation.session.id.clone(), operation.clone());
+            merge_pending_sessions(app);
+            app.status_message = Some(format!("{}: {message}", operation.failure_prefix));
+        }
+    }
+
+    Ok(true)
+}
+
+fn find_created_session_id(
+    operation: &PendingOperation,
+    sessions: &[SessionRecord],
+) -> Option<String> {
+    find_created_session_id_with_parent(operation, sessions, true)
+        .or_else(|| find_created_session_id_with_parent(operation, sessions, false))
+}
+
+fn find_created_session_id_with_parent(
+    operation: &PendingOperation,
+    sessions: &[SessionRecord],
+    require_parent: bool,
+) -> Option<String> {
+    let mut matches = sessions
+        .iter()
+        .filter(|session| {
+            if require_parent
+                && let Some(parent_session_id) = operation.parent_session_id.as_deref()
+            {
+                if session.parent_session_id.as_deref() != Some(parent_session_id) {
+                    return false;
+                }
+            }
+            if let Some(expected_name) = operation.expected_name.as_deref() {
+                if session.name != expected_name {
+                    return false;
+                }
+            }
+            if let Some(expected_group) = operation.expected_group.as_deref() {
+                if session.group_name != expected_group {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| right.created_at.cmp(&left.created_at))
+    });
+    matches.first().map(|session| session.id.clone())
+}
+
 fn sync_embedded_tmux(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
@@ -2480,6 +2854,12 @@ fn sync_embedded_tmux(
         app.status_message = Some("no session selected".to_string());
         return true;
     };
+    if app.pending_operations.contains_key(&session.id) {
+        app.embedded = None;
+        app.mode = Mode::Normal;
+        app.status_message = Some("operation in progress".to_string());
+        return true;
+    }
     if !matches!(
         session.status,
         SessionStatus::Running | SessionStatus::Starting
@@ -2546,6 +2926,9 @@ fn sync_terminal_preview(
     let Some(session) = view.selected.as_ref() else {
         return clear_terminal_preview(app) || changed;
     };
+    if app.pending_operations.contains_key(&session.id) {
+        return clear_terminal_preview(app) || changed;
+    }
     if !session_is_live(session.status) {
         return clear_terminal_preview(app) || changed;
     }
@@ -2692,16 +3075,18 @@ fn tmux_target_for_session(session: &SessionSummary) -> String {
         .unwrap_or_else(|| tmux_session_name_for_id(&session.id))
 }
 
-fn process_key<B, F>(
+fn process_key_with_background<B, F, G>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     handle_action: &mut F,
+    spawn_background_action: &mut G,
     key: KeyEvent,
 ) -> Result<bool>
 where
     B: ratatui::backend::Backend,
     B::Error: std::fmt::Display,
     F: FnMut(TuiAction) -> Result<Vec<SessionRecord>>,
+    G: FnMut(BackgroundActionRequest),
 {
     if matches!(app.mode, Mode::Normal | Mode::Search) && is_plain_ctrl_key(key, 't') {
         toggle_mouse_capture(app);
@@ -2713,7 +3098,8 @@ where
             focus_selected_session(app);
         }
         Mode::Normal => {
-            if handle_normal_key(key, app, handle_action)? {
+            if handle_normal_key_with_background(key, app, handle_action, spawn_background_action)?
+            {
                 return Ok(true);
             }
         }
@@ -2726,11 +3112,11 @@ where
                     .draw(|frame| render(frame, app))
                     .map_err(|err| AppError::msg(format!("draw launch feedback: {err}")))?;
             }
-            handle_new_key(key, app, handle_action)?;
+            handle_new_key_with_background(key, app, spawn_background_action)?;
         }
         Mode::CreateGroup(_) => handle_create_group_key(key, app, handle_action)?,
         Mode::GroupSettings(_) => handle_group_settings_key(key, app, handle_action)?,
-        Mode::Fork(_) => handle_fork_key(key, app, handle_action)?,
+        Mode::Fork(_) => handle_fork_key_with_background(key, app, spawn_background_action)?,
         Mode::Session(_) => handle_session_key(key, app)?,
         Mode::Move(_) => handle_move_key(key, app, handle_action)?,
         Mode::Rename(_) => handle_rename_key(key, app, handle_action)?,
@@ -2738,6 +3124,30 @@ where
         Mode::Help => handle_help_key(key, app),
     }
     Ok(false)
+}
+
+#[cfg(test)]
+fn process_key<B, F>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    handle_action: &mut F,
+    key: KeyEvent,
+) -> Result<bool>
+where
+    B: ratatui::backend::Backend,
+    B::Error: std::fmt::Display,
+    F: FnMut(TuiAction) -> Result<Vec<SessionRecord>>,
+{
+    let mut background_requests = Vec::new();
+    let result = process_key_with_background(
+        terminal,
+        app,
+        handle_action,
+        &mut |request| background_requests.push(request),
+        key,
+    )?;
+    complete_background_requests_synchronously(app, handle_action, background_requests)?;
+    Ok(result)
 }
 
 fn is_plain_ctrl_key(key: KeyEvent, ch: char) -> bool {
@@ -2919,6 +3329,9 @@ fn scroll_session_preview(app: &mut App, delta: i16) -> bool {
 }
 
 fn focus_selected_session(app: &mut App) {
+    if block_selected_pending_operation(app, "open") {
+        return;
+    }
     if selected_id(app).is_some() {
         app.detail_scroll = 0;
         app.mode = Mode::Session(SendForm::default());
@@ -2936,10 +3349,12 @@ where
     let session_ids = app
         .sessions
         .iter()
+        .filter(|session| !app.pending_operations.contains_key(&session.id))
         .filter(|session| query.is_empty() || matches_query(session, &query))
         .map(|session| session.id.clone())
         .collect::<Vec<_>>();
     if session_ids.is_empty() {
+        apply_pending_statuses(app);
         return Ok(());
     }
 
@@ -2953,6 +3368,7 @@ where
             app.status_message = Some(format!("status failed: {err}"));
         }
     }
+    apply_pending_statuses(app);
     Ok(())
 }
 
@@ -2974,6 +3390,22 @@ where
         return Ok(());
     };
     if !force && app.details_session_id.as_deref() == Some(session_id.as_str()) {
+        return Ok(());
+    }
+
+    if let Some(operation) = app.pending_operations.get(&session_id) {
+        let status = operation.status();
+        app.deck_statuses.insert(session_id.clone(), status.clone());
+        app.details = TuiDetails {
+            deck_status: status.deck_status,
+            activity: status.activity,
+            output: match &operation.state {
+                PendingOperationState::Failed(message) => message.clone(),
+                PendingOperationState::Running => String::new(),
+            },
+            workspace: None,
+        };
+        app.details_session_id = Some(session_id);
         return Ok(());
     }
 
@@ -3051,6 +3483,7 @@ where
     } else {
         handle_action(TuiAction::Refresh)?
     };
+    merge_pending_sessions(app);
     if let Some(id) = selected {
         select_matching_session(app, |session| session.id == id);
     }
@@ -3064,9 +3497,15 @@ where
     Ok(())
 }
 
-fn handle_normal_key<F>(key: KeyEvent, app: &mut App, handle_action: &mut F) -> Result<bool>
+fn handle_normal_key_with_background<F, G>(
+    key: KeyEvent,
+    app: &mut App,
+    handle_action: &mut F,
+    spawn_background_action: &mut G,
+) -> Result<bool>
 where
     F: FnMut(TuiAction) -> Result<Vec<SessionRecord>>,
+    G: FnMut(BackgroundActionRequest),
 {
     if is_plain_char_key(key, 'q')
         || (key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE)
@@ -3091,9 +3530,12 @@ where
             reset_detail_view(app);
         }
         KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            create_shell_session(app, handle_action)?;
+            create_shell_session(app, spawn_background_action)?;
         }
         KeyCode::Char('N') => {
+            if block_selected_pending_operation(app, "duplicate") {
+                return Ok(false);
+            }
             if let Some(session) = app.view().selected {
                 app.mode = Mode::New(new_form_for_session(app, &session));
                 app.status_message = None;
@@ -3106,6 +3548,9 @@ where
             app.status_message = None;
         }
         KeyCode::Char('m') => {
+            if block_selected_pending_operation(app, "move") {
+                return Ok(false);
+            }
             if let Some(session) = app.view().selected {
                 app.mode = Mode::Move(MoveForm::for_session(&session));
                 app.status_message = None;
@@ -3114,6 +3559,9 @@ where
             }
         }
         KeyCode::Char('r') => {
+            if block_selected_pending_operation(app, "rename") {
+                return Ok(false);
+            }
             if let Some(session) = app.view().selected {
                 app.mode = Mode::Rename(RenameForm::for_session(&session));
                 app.status_message = None;
@@ -3121,18 +3569,20 @@ where
                 app.status_message = Some("no session selected".to_string());
             }
         }
-        KeyCode::Char('d') => run_selected_action(
+        KeyCode::Char('d') => run_selected_action_with_background(
             app,
             handle_action,
+            spawn_background_action,
             |session_id| TuiAction::Remove {
                 session_id,
                 mode: DeleteMode::MetadataOnly,
             },
             "deleted",
         )?,
-        KeyCode::Char('D') => run_selected_action(
+        KeyCode::Char('D') => run_selected_action_with_background(
             app,
             handle_action,
+            spawn_background_action,
             |session_id| TuiAction::Remove {
                 session_id,
                 mode: DeleteMode::CleanupWorktree,
@@ -3140,6 +3590,9 @@ where
             "deleted and cleaned up",
         )?,
         KeyCode::Char('f') => {
+            if block_selected_pending_operation(app, "fork") {
+                return Ok(false);
+            }
             if let Some(session) = app.view().selected {
                 app.mode = Mode::Fork(ForkForm::for_session(&session));
                 app.status_message = None;
@@ -3169,6 +3622,19 @@ where
     Ok(false)
 }
 
+#[cfg(test)]
+fn handle_normal_key<F>(key: KeyEvent, app: &mut App, handle_action: &mut F) -> Result<bool>
+where
+    F: FnMut(TuiAction) -> Result<Vec<SessionRecord>>,
+{
+    let mut background_requests = Vec::new();
+    let result = handle_normal_key_with_background(key, app, handle_action, &mut |request| {
+        background_requests.push(request)
+    })?;
+    complete_background_requests_synchronously(app, handle_action, background_requests)?;
+    Ok(result)
+}
+
 fn reset_detail_view(app: &mut App) {
     app.detail_scroll = 0;
     app.preview_scroll = 0;
@@ -3192,9 +3658,9 @@ fn open_group_settings(app: &mut App) {
     app.status_message = None;
 }
 
-fn create_shell_session<F>(app: &mut App, handle_action: &mut F) -> Result<()>
+fn create_shell_session<G>(app: &mut App, spawn_background_action: &mut G) -> Result<()>
 where
-    F: FnMut(TuiAction) -> Result<Vec<SessionRecord>>,
+    G: FnMut(BackgroundActionRequest),
 {
     let selected = app.view().selected;
     let path = selected
@@ -3218,21 +3684,58 @@ where
         prompt: None,
         parent_session_id: None,
     };
-    match handle_action(TuiAction::Create(request)) {
-        Ok(sessions) => {
-            app.sessions = sessions;
-            app.query.clear();
-            app.search_results_active = false;
-            app.last_agent = "shell".to_string();
-            select_matching_session(app, |session| {
-                session.name == name && session.group_name == group_name
-            });
-            app.mode = Mode::Normal;
-            app.status_message = Some("created shell session".to_string());
-        }
-        Err(err) => app.status_message = Some(format!("create shell failed: {err}")),
-    }
+    start_create_operation(
+        app,
+        request,
+        "created shell session",
+        "create shell failed",
+        spawn_background_action,
+    );
     Ok(())
+}
+
+fn start_create_operation<G>(
+    app: &mut App,
+    request: CreateSession,
+    success_message: &str,
+    failure_prefix: &str,
+    spawn_background_action: &mut G,
+) where
+    G: FnMut(BackgroundActionRequest),
+{
+    let pending_id = next_pending_session_id(app);
+    let placeholder = pending_create_session(pending_id.clone(), &request);
+    let label = if request.worktree.is_some() {
+        "creating worktree"
+    } else {
+        "creating"
+    };
+    let operation = PendingOperation {
+        kind: PendingOperationKind::Create,
+        session: placeholder.clone(),
+        state: PendingOperationState::Running,
+        running_label: label.to_string(),
+        failed_label: "create failed".to_string(),
+        failure_prefix: failure_prefix.to_string(),
+        success_message: success_message.to_string(),
+        expected_name: Some(placeholder.name.clone()),
+        expected_group: Some(placeholder.group_name.clone()),
+        parent_session_id: None,
+        delete_selection_target: None,
+    };
+    app.pending_operations.insert(pending_id.clone(), operation);
+    app.sessions.push(placeholder);
+    app.query.clear();
+    app.search_results_active = false;
+    app.last_agent = request.agent.clone();
+    app.mode = Mode::Normal;
+    app.status_message = Some(label.to_string());
+    apply_pending_statuses(app);
+    select_matching_session(app, |session| session.id == pending_id);
+    spawn_background_action(BackgroundActionRequest {
+        session_id: pending_id,
+        action: TuiAction::Create(request),
+    });
 }
 
 fn toggle_selected_group<F>(app: &mut App, handle_action: &mut F) -> Result<()>
@@ -3338,9 +3841,13 @@ fn handle_help_key(key: KeyEvent, app: &mut App) {
     }
 }
 
-fn handle_new_key<F>(key: KeyEvent, app: &mut App, handle_action: &mut F) -> Result<()>
+fn handle_new_key_with_background<G>(
+    key: KeyEvent,
+    app: &mut App,
+    spawn_background_action: &mut G,
+) -> Result<()>
 where
-    F: FnMut(TuiAction) -> Result<Vec<SessionRecord>>,
+    G: FnMut(BackgroundActionRequest),
 {
     let mut submit = false;
     let agent_choices = app.agent_choices.clone();
@@ -3439,33 +3946,26 @@ where
             _ => return Ok(()),
         };
 
-        let created_name = if request.name.trim().is_empty() {
-            project_name(&request.path)
-        } else {
-            request.name.clone()
-        };
-        let created_group = request.group_name.clone();
-        let created_agent = request.agent.clone();
-        match handle_action(TuiAction::Create(request)) {
-            Ok(sessions) => {
-                app.sessions = sessions;
-                app.query.clear();
-                app.search_results_active = false;
-                app.last_agent = created_agent;
-                select_matching_session(app, |session| {
-                    session.name == created_name && session.group_name == created_group
-                });
-                app.mode = Mode::Normal;
-                app.status_message = Some("created session".to_string());
-            }
-            Err(err) => {
-                set_new_form_launching(app, false);
-                app.status_message = Some(format!("create failed: {err}"));
-            }
-        }
+        start_create_operation(
+            app,
+            request,
+            "created session",
+            "create failed",
+            spawn_background_action,
+        );
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+fn handle_new_key<F>(key: KeyEvent, app: &mut App, handle_action: &mut F) -> Result<()>
+where
+    F: FnMut(TuiAction) -> Result<Vec<SessionRecord>>,
+{
+    let mut background_requests = Vec::new();
+    handle_new_key_with_background(key, app, &mut |request| background_requests.push(request))?;
+    complete_background_requests_synchronously(app, handle_action, background_requests)
 }
 
 fn handle_create_group_key<F>(key: KeyEvent, app: &mut App, handle_action: &mut F) -> Result<()>
@@ -3637,9 +4137,13 @@ where
     Ok(())
 }
 
-fn handle_fork_key<F>(key: KeyEvent, app: &mut App, handle_action: &mut F) -> Result<()>
+fn handle_fork_key_with_background<G>(
+    key: KeyEvent,
+    app: &mut App,
+    spawn_background_action: &mut G,
+) -> Result<()>
 where
-    F: FnMut(TuiAction) -> Result<Vec<SessionRecord>>,
+    G: FnMut(BackgroundActionRequest),
 {
     let mut submit = false;
 
@@ -3686,29 +4190,65 @@ where
             },
             _ => return Ok(()),
         };
-        let expected_name = request.name.clone();
-        let expected_group = request.group_name.clone();
-        match handle_action(TuiAction::Fork(request)) {
-            Ok(sessions) => {
-                app.sessions = sessions;
-                if let Some(name) = expected_name {
-                    select_matching_session(app, |session| {
-                        session.name == name
-                            && expected_group
-                                .as_deref()
-                                .is_none_or(|group| session.group_name == group)
-                    });
-                }
-                app.mode = Mode::Normal;
-                app.status_message = Some("forked session".to_string());
-            }
-            Err(err) => {
-                app.status_message = Some(format!("fork failed: {err}"));
-            }
-        }
+        start_fork_operation(app, request, spawn_background_action);
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+fn handle_fork_key<F>(key: KeyEvent, app: &mut App, handle_action: &mut F) -> Result<()>
+where
+    F: FnMut(TuiAction) -> Result<Vec<SessionRecord>>,
+{
+    let mut background_requests = Vec::new();
+    handle_fork_key_with_background(key, app, &mut |request| background_requests.push(request))?;
+    complete_background_requests_synchronously(app, handle_action, background_requests)
+}
+
+fn start_fork_operation<G>(
+    app: &mut App,
+    request: ForkSessionRequest,
+    spawn_background_action: &mut G,
+) where
+    G: FnMut(BackgroundActionRequest),
+{
+    let Some(parent) = find_session_record(app, &request.parent_session_id) else {
+        app.status_message = Some("parent session not found".to_string());
+        return;
+    };
+    let pending_id = next_pending_session_id(app);
+    let placeholder = pending_fork_session(pending_id.clone(), &request, &parent);
+    let label = if request.worktree_branch.is_some() {
+        "creating worktree"
+    } else {
+        "creating"
+    };
+    let operation = PendingOperation {
+        kind: PendingOperationKind::Fork,
+        session: placeholder.clone(),
+        state: PendingOperationState::Running,
+        running_label: label.to_string(),
+        failed_label: "fork failed".to_string(),
+        failure_prefix: "fork failed".to_string(),
+        success_message: "forked session".to_string(),
+        expected_name: Some(placeholder.name.clone()),
+        expected_group: Some(placeholder.group_name.clone()),
+        parent_session_id: Some(parent.id.clone()),
+        delete_selection_target: None,
+    };
+    app.pending_operations.insert(pending_id.clone(), operation);
+    app.sessions.push(placeholder);
+    app.query.clear();
+    app.search_results_active = false;
+    app.mode = Mode::Normal;
+    app.status_message = Some(label.to_string());
+    apply_pending_statuses(app);
+    select_matching_session(app, |session| session.id == pending_id);
+    spawn_background_action(BackgroundActionRequest {
+        session_id: pending_id,
+        action: TuiAction::Fork(request),
+    });
 }
 
 fn select_matching_session(app: &mut App, matches: impl FnMut(&SessionSummary) -> bool) {
@@ -3906,6 +4446,62 @@ where
     Ok(())
 }
 
+fn run_selected_action_with_background<F, G, M>(
+    app: &mut App,
+    handle_action: &mut F,
+    spawn_background_action: &mut G,
+    build: M,
+    done: &str,
+) -> Result<()>
+where
+    F: FnMut(TuiAction) -> Result<Vec<SessionRecord>>,
+    G: FnMut(BackgroundActionRequest),
+    M: FnOnce(String) -> TuiAction,
+{
+    let Some(session_id) = selected_id(app) else {
+        app.status_message = Some("no session selected".to_string());
+        return Ok(());
+    };
+    let selected_session_id = session_id.clone();
+    let action = build(session_id);
+    if let TuiAction::Remove { session_id, mode } = &action {
+        start_remove_operation(
+            app,
+            session_id.clone(),
+            *mode,
+            done,
+            spawn_background_action,
+        );
+        return Ok(());
+    }
+    if block_selected_pending_operation(app, done) {
+        return Ok(());
+    }
+    let target_session_id = match &action {
+        TuiAction::Remove { .. } => delete_selection_target(app, &selected_session_id),
+        _ => Some(selected_session_id.clone()),
+    };
+    match handle_action(action) {
+        Ok(sessions) => {
+            app.sessions = sessions;
+            invalidate_session_cache(app, &selected_session_id);
+            if app.search_results_active && !app.query.trim().is_empty() {
+                refresh_sessions(app, handle_action)?;
+            }
+            if let Some(target_session_id) = target_session_id {
+                select_matching_session(app, |session| session.id == target_session_id);
+            } else {
+                select_matching_session(app, |_| false);
+            }
+            app.detail_scroll = 0;
+            app.status_message = Some(done.to_string());
+        }
+        Err(err) => app.status_message = Some(format!("{done} failed: {err}")),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn run_selected_action<F, M>(
     app: &mut App,
     handle_action: &mut F,
@@ -3937,13 +4533,89 @@ where
                 select_matching_session(app, |session| session.id == target_session_id);
             } else {
                 select_matching_session(app, |_| false);
+                app.detail_scroll = 0;
             }
-            app.detail_scroll = 0;
             app.status_message = Some(done.to_string());
         }
         Err(err) => app.status_message = Some(format!("{done} failed: {err}")),
     }
     Ok(())
+}
+
+fn start_remove_operation<G>(
+    app: &mut App,
+    session_id: String,
+    mode: DeleteMode,
+    done: &str,
+    spawn_background_action: &mut G,
+) where
+    G: FnMut(BackgroundActionRequest),
+{
+    if dismiss_failed_placeholder(app, &session_id) {
+        return;
+    }
+
+    if let Some(operation) = app.pending_operations.get(&session_id) {
+        if operation.is_running() {
+            app.status_message = Some(format!("delete blocked: {}", operation.running_label));
+            return;
+        }
+    }
+
+    let label = match mode {
+        DeleteMode::CleanupWorktree => "deleting worktree",
+        DeleteMode::MetadataOnly | DeleteMode::Purge => "deleting",
+    };
+    let failed_label = match mode {
+        DeleteMode::CleanupWorktree => "delete cleanup failed",
+        DeleteMode::MetadataOnly | DeleteMode::Purge => "delete failed",
+    };
+    let session = app
+        .pending_operations
+        .get(&session_id)
+        .map(|operation| operation.session.clone())
+        .or_else(|| find_session_record(app, &session_id));
+    let Some(session) = session else {
+        app.status_message = Some("no session selected".to_string());
+        return;
+    };
+    let target = delete_selection_target(app, &session_id);
+    let operation = PendingOperation {
+        kind: PendingOperationKind::Delete,
+        session,
+        state: PendingOperationState::Running,
+        running_label: label.to_string(),
+        failed_label: failed_label.to_string(),
+        failure_prefix: failed_label.to_string(),
+        success_message: done.to_string(),
+        expected_name: None,
+        expected_group: None,
+        parent_session_id: None,
+        delete_selection_target: target,
+    };
+    app.pending_operations.insert(session_id.clone(), operation);
+    apply_pending_statuses(app);
+    app.status_message = Some(label.to_string());
+    spawn_background_action(BackgroundActionRequest {
+        session_id: session_id.clone(),
+        action: TuiAction::Remove { session_id, mode },
+    });
+}
+
+fn dismiss_failed_placeholder(app: &mut App, session_id: &str) -> bool {
+    let should_dismiss = app
+        .pending_operations
+        .get(session_id)
+        .is_some_and(PendingOperation::is_failed_placeholder);
+    if !should_dismiss {
+        return false;
+    }
+    app.pending_operations.remove(session_id);
+    app.sessions.retain(|session| session.id != session_id);
+    app.deck_statuses.remove(session_id);
+    select_matching_session(app, |_| false);
+    app.status_message = Some("dismissed failed create".to_string());
+    true
 }
 
 fn delete_selection_target(app: &App, session_id: &str) -> Option<String> {
@@ -6075,6 +6747,8 @@ mod tests {
             group_default_paths: BTreeMap::new(),
             group_defaults: BTreeMap::new(),
             deck_statuses: BTreeMap::new(),
+            pending_operations: BTreeMap::new(),
+            next_pending_operation_id: 1,
             details: TuiDetails::default(),
             details_session_id: None,
             query: String::new(),
@@ -7389,6 +8063,249 @@ mod tests {
         assert!(created);
         assert_eq!(app.view().selected.unwrap().id, "new");
         assert_eq!(app.status_message.as_deref(), Some("created session"));
+    }
+
+    #[test]
+    fn create_with_background_returns_pending_row_before_completion() {
+        let mut app = test_app(vec![record("old", "ops", "alpha", false)]);
+        let form = NewForm::default();
+        let default_name = form.default_name();
+        app.mode = Mode::New(form);
+        let mut requests = Vec::new();
+
+        handle_new_key_with_background(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &mut app,
+            &mut |request| requests.push(request),
+        )
+        .unwrap();
+
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(requests[0].action, TuiAction::Create(_)));
+        let selected = app.view().selected.unwrap();
+        assert!(selected.id.starts_with("tui-pending-"));
+        assert_eq!(selected.name, default_name);
+        assert_eq!(selected.deck_status, SessionDeckStatus::Starting);
+        assert_eq!(session_activity_label(&selected), Some("creating"));
+        assert_eq!(app.status_message.as_deref(), Some("creating"));
+    }
+
+    #[test]
+    fn create_background_success_replaces_placeholder_and_selects_created_session() {
+        let mut app = test_app(vec![record("old", "ops", "alpha", false)]);
+        let form = NewForm::default();
+        let default_name = form.default_name();
+        app.mode = Mode::New(form);
+        let mut requests = Vec::new();
+        handle_new_key_with_background(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &mut app,
+            &mut |request| requests.push(request),
+        )
+        .unwrap();
+        let pending_id = requests[0].session_id.clone();
+        let mut created = record("new", "default", &default_name, false);
+        created.updated_at = 10;
+        let mut handle = |_action| Ok(Vec::new());
+
+        apply_background_action_result(
+            &mut app,
+            BackgroundActionResult {
+                session_id: pending_id.clone(),
+                result: Ok(vec![record("old", "ops", "alpha", false), created]),
+            },
+            &mut handle,
+        )
+        .unwrap();
+
+        assert!(!app.pending_operations.contains_key(&pending_id));
+        assert!(!app.sessions.iter().any(|session| session.id == pending_id));
+        assert_eq!(app.view().selected.unwrap().id, "new");
+        assert_eq!(app.status_message.as_deref(), Some("created session"));
+    }
+
+    #[test]
+    fn delete_with_background_marks_row_and_completion_preserves_neighbor_selection() {
+        let mut app = test_app(vec![
+            record("1", "ops", "alpha", false),
+            record("2", "ops", "beta", false),
+        ]);
+        let mut handle = |_action| Ok(Vec::new());
+        let mut requests = Vec::new();
+
+        run_selected_action_with_background(
+            &mut app,
+            &mut handle,
+            &mut |request| requests.push(request),
+            |session_id| TuiAction::Remove {
+                session_id,
+                mode: DeleteMode::CleanupWorktree,
+            },
+            "deleted and cleaned up",
+        )
+        .unwrap();
+
+        assert_eq!(requests.len(), 1);
+        let selected = app.view().selected.unwrap();
+        assert_eq!(selected.id, "1");
+        assert_eq!(selected.deck_status, SessionDeckStatus::Starting);
+        assert_eq!(session_activity_label(&selected), Some("deleting worktree"));
+
+        apply_background_action_result(
+            &mut app,
+            BackgroundActionResult {
+                session_id: "1".to_string(),
+                result: Ok(vec![record("2", "ops", "beta", false)]),
+            },
+            &mut handle,
+        )
+        .unwrap();
+
+        assert!(!app.pending_operations.contains_key("1"));
+        assert_eq!(app.view().selected.unwrap().id, "2");
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("deleted and cleaned up")
+        );
+    }
+
+    #[test]
+    fn create_failure_keeps_errored_placeholder_and_delete_dismisses_it() {
+        let mut app = test_app(vec![record("old", "ops", "alpha", false)]);
+        app.mode = Mode::New(NewForm::default());
+        let mut requests = Vec::new();
+        handle_new_key_with_background(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &mut app,
+            &mut |request| requests.push(request),
+        )
+        .unwrap();
+        let pending_id = requests[0].session_id.clone();
+        let mut handle = |_action| Ok(Vec::new());
+
+        apply_background_action_result(
+            &mut app,
+            BackgroundActionResult {
+                session_id: pending_id.clone(),
+                result: Err("boom".to_string()),
+            },
+            &mut handle,
+        )
+        .unwrap();
+
+        let selected = app.view().selected.unwrap();
+        assert_eq!(selected.id, pending_id);
+        assert_eq!(selected.deck_status, SessionDeckStatus::Errored);
+        assert_eq!(session_activity_label(&selected), Some("create failed"));
+        assert_eq!(app.status_message.as_deref(), Some("create failed: boom"));
+
+        let mut dismiss_requests = Vec::new();
+        run_selected_action_with_background(
+            &mut app,
+            &mut handle,
+            &mut |request| dismiss_requests.push(request),
+            |session_id| TuiAction::Remove {
+                session_id,
+                mode: DeleteMode::MetadataOnly,
+            },
+            "deleted",
+        )
+        .unwrap();
+
+        assert!(dismiss_requests.is_empty());
+        assert!(!app.sessions.iter().any(|session| session.id == pending_id));
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("dismissed failed create")
+        );
+    }
+
+    #[test]
+    fn delete_failure_keeps_row_failed_and_retry_restarts_background_delete() {
+        let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
+        let mut handle = |_action| Ok(Vec::new());
+        let mut requests = Vec::new();
+        run_selected_action_with_background(
+            &mut app,
+            &mut handle,
+            &mut |request| requests.push(request),
+            |session_id| TuiAction::Remove {
+                session_id,
+                mode: DeleteMode::MetadataOnly,
+            },
+            "deleted",
+        )
+        .unwrap();
+
+        apply_background_action_result(
+            &mut app,
+            BackgroundActionResult {
+                session_id: "1".to_string(),
+                result: Err("busy".to_string()),
+            },
+            &mut handle,
+        )
+        .unwrap();
+
+        let selected = app.view().selected.unwrap();
+        assert_eq!(selected.id, "1");
+        assert_eq!(selected.deck_status, SessionDeckStatus::Errored);
+        assert_eq!(session_activity_label(&selected), Some("delete failed"));
+
+        let mut retry_requests = Vec::new();
+        run_selected_action_with_background(
+            &mut app,
+            &mut handle,
+            &mut |request| retry_requests.push(request),
+            |session_id| TuiAction::Remove {
+                session_id,
+                mode: DeleteMode::MetadataOnly,
+            },
+            "deleted",
+        )
+        .unwrap();
+
+        assert_eq!(retry_requests.len(), 1);
+        let selected = app.view().selected.unwrap();
+        assert_eq!(selected.deck_status, SessionDeckStatus::Starting);
+        assert_eq!(session_activity_label(&selected), Some("deleting"));
+    }
+
+    #[test]
+    fn pending_status_survives_session_and_deck_refresh() {
+        let old = record("old", "ops", "alpha", false);
+        let mut app = test_app(vec![old.clone()]);
+        app.mode = Mode::New(NewForm::default());
+        let mut requests = Vec::new();
+        handle_new_key_with_background(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &mut app,
+            &mut |request| requests.push(request),
+        )
+        .unwrap();
+        let pending_id = requests[0].session_id.clone();
+        let mut handle = |action| match action {
+            TuiAction::Refresh => Ok(vec![old.clone()]),
+            _ => Ok(Vec::new()),
+        };
+        refresh_sessions(&mut app, &mut handle).unwrap();
+
+        let mut status_ids = Vec::new();
+        refresh_deck_statuses(&mut app, &mut |ids| {
+            status_ids = ids.to_vec();
+            Ok(vec![("old".to_string(), SessionDeckStatus::Idle.into())])
+        })
+        .unwrap();
+
+        assert!(!status_ids.contains(&pending_id));
+        let pending = app
+            .view()
+            .visible_sessions
+            .into_iter()
+            .find(|session| session.id == pending_id)
+            .unwrap();
+        assert_eq!(pending.deck_status, SessionDeckStatus::Starting);
+        assert_eq!(session_activity_label(&pending), Some("creating"));
     }
 
     #[test]
@@ -8713,6 +9630,8 @@ mod tests {
             group_default_paths: BTreeMap::new(),
             group_defaults: BTreeMap::new(),
             deck_statuses: BTreeMap::from([("1".to_string(), SessionDeckStatus::Waiting.into())]),
+            pending_operations: BTreeMap::new(),
+            next_pending_operation_id: 1,
             details: TuiDetails {
                 deck_status: SessionDeckStatus::Waiting,
                 activity: None,

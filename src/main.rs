@@ -5,7 +5,7 @@ use agent_helm::tui::{
 use agent_helm::{
     config::AppConfig,
     controller::ApplicationController,
-    error::Result,
+    error::{AppError, Result},
     models::{
         CostFilter, CreateSession, DeleteMode, DeleteSessionRequest, ForkSessionRequest,
         GroupSettingsUpdate, ProjectSpec, SessionDeckStatus, StructuredEvent, now_ts,
@@ -14,7 +14,11 @@ use agent_helm::{
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
-use std::{collections::HashMap, process::ExitCode};
+use std::{
+    collections::HashMap,
+    process::ExitCode,
+    sync::{Arc, Mutex},
+};
 
 #[cfg(feature = "serve")]
 use agent_helm::api;
@@ -1035,7 +1039,8 @@ fn run_command(
             let groups = controller.list_groups()?;
             let status_controller = controller.clone();
             let details_controller = controller.clone();
-            let mut action_controller = controller.clone();
+            let action_controller = controller.clone();
+            let action_config = Arc::new(Mutex::new(controller.config.clone()));
             let headroom_metrics = agent_helm::tui::HeadroomMetrics::load(
                 &controller.config.headroom_proxy_savings_path,
             );
@@ -1117,6 +1122,11 @@ fn run_command(
                     })
                 },
                 move |action| {
+                    let mut action_controller = action_controller.clone();
+                    action_controller.config = action_config
+                        .lock()
+                        .map_err(|_| AppError::msg("tui action config lock poisoned"))?
+                        .clone();
                     match action {
                         TuiAction::Create(request) => {
                             action_controller.create_session(request)?;
@@ -1195,6 +1205,10 @@ fn run_command(
                                 .map(|setting| (setting.name.clone(), setting.to_profile()))
                                 .collect::<HashMap<_, _>>();
                             action_controller.config.save_tool_settings(tools)?;
+                            *action_config
+                                .lock()
+                                .map_err(|_| AppError::msg("tui action config lock poisoned"))? =
+                                action_controller.config.clone();
                         }
                     }
                     action_controller.list_sessions()
