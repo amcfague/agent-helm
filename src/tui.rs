@@ -2595,6 +2595,7 @@ where
 {
     refresh_deck_statuses(app, load_deck_statuses)?;
     refresh_details(app, load_details, true)?;
+    initialize_sidebar_width(app, terminal.size()?);
     let preview_worker = PreviewWorker::spawn();
     let (background_tx, background_rx) = mpsc::channel();
     let background_action_handler = (*handle_action).clone();
@@ -4661,6 +4662,23 @@ fn body_layout_for_view(
 ) -> BodyLayout {
     let width = sidebar_width.unwrap_or_else(|| auto_sidebar_width(area, view, animation_frame));
     body_layout(area, width)
+}
+
+fn initialize_sidebar_width(app: &mut App, size: ratatui::layout::Size) {
+    if app.sidebar_width.is_some() {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(Rect::new(0, 0, size.width, size.height));
+    let view = app.view();
+    app.sidebar_width = Some(auto_sidebar_width(chunks[1], &view, app.animation_frame));
 }
 
 fn body_layout(area: Rect, sidebar_width: u16) -> BodyLayout {
@@ -9294,6 +9312,36 @@ mod tests {
         };
 
         assert_eq!(group_header_text(0, &group), "1. ops (2) - ◆1 ·1");
+    }
+
+    #[test]
+    fn initialize_sidebar_width_freezes_auto_width() {
+        let size = ratatui::layout::Size {
+            width: 100,
+            height: 20,
+        };
+        let body = Rect::new(0, 4, 100, 15);
+        let mut app = test_app(vec![record("1", "ops", "a", false)]);
+
+        initialize_sidebar_width(&mut app, size);
+        let initial = app.sidebar_width.unwrap();
+
+        app.sessions.push(record(
+            "2",
+            "ops",
+            "session-name-long-enough-to-grow-the-auto-sidebar",
+            false,
+        ));
+        assert!(auto_sidebar_width(body, &app.view(), 0) > initial);
+
+        initialize_sidebar_width(&mut app, size);
+        assert_eq!(app.sidebar_width, Some(initial));
+        assert_eq!(
+            body_layout_for_view(body, &app.view(), app.sidebar_width, 0)
+                .sidebar
+                .width,
+            initial
+        );
     }
 
     #[test]
