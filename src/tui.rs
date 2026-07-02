@@ -52,6 +52,7 @@ const ACTIVITY_ANIMATION_INTERVAL: Duration = Duration::from_millis(250);
 const SESSION_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const DETAILS_REFRESH_DEBOUNCE: Duration = Duration::from_millis(125);
 const PREVIEW_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+const HEADER_HEIGHT: u16 = 5;
 const PREVIEW_SCROLL_LINES: u16 = 1;
 const PREVIEW_MAX_SCROLL_LINES: u16 = 5000;
 const EMBED_READ_BUF_SIZE: usize = 8192;
@@ -558,6 +559,275 @@ impl HeadroomMetrics {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SystemMetrics {
+    load_average: Option<f64>,
+    cpu_percent: Option<f64>,
+    memory_used_bytes: Option<u64>,
+    memory_total_bytes: Option<u64>,
+}
+
+impl SystemMetrics {
+    fn label(&self) -> String {
+        format!(
+            "sys load {} cpu {} mem {}",
+            format_optional_number(self.load_average, 2),
+            format_optional_percent(self.cpu_percent),
+            format_memory_usage(self.memory_used_bytes, self.memory_total_bytes)
+        )
+    }
+
+    fn unavailable_label() -> String {
+        "sys load -- cpu -- mem --".to_string()
+    }
+}
+
+#[derive(Debug, Default)]
+struct SystemMetricsSampler {
+    previous_cpu: Option<CpuSample>,
+}
+
+impl SystemMetricsSampler {
+    fn sample(&mut self) -> Option<SystemMetrics> {
+        let load_average = read_load_average();
+        let cpu_percent = read_cpu_percent(&mut self.previous_cpu);
+        let (memory_used_bytes, memory_total_bytes) = read_memory_usage()
+            .map(|(used, total)| (Some(used), Some(total)))
+            .unwrap_or((None, None));
+
+        if load_average.is_none()
+            && cpu_percent.is_none()
+            && memory_used_bytes.is_none()
+            && memory_total_bytes.is_none()
+        {
+            return None;
+        }
+
+        Some(SystemMetrics {
+            load_average,
+            cpu_percent,
+            memory_used_bytes,
+            memory_total_bytes,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CpuSample {
+    idle: u64,
+    total: u64,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl CpuSample {
+    fn percent_since(self, previous: Self) -> Option<f64> {
+        let total_delta = self.total.checked_sub(previous.total)?;
+        if total_delta == 0 {
+            return None;
+        }
+        let idle_delta = self.idle.saturating_sub(previous.idle);
+        let active_delta = total_delta.saturating_sub(idle_delta);
+        Some(active_delta as f64 * 100.0 / total_delta as f64)
+    }
+}
+
+fn format_optional_number(value: Option<f64>, decimals: usize) -> String {
+    value
+        .map(|value| format!("{value:.decimals$}"))
+        .unwrap_or_else(|| "--".to_string())
+}
+
+fn format_optional_percent(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{:.0}%", value.clamp(0.0, 100.0)))
+        .unwrap_or_else(|| "--".to_string())
+}
+
+fn format_memory_usage(used_bytes: Option<u64>, total_bytes: Option<u64>) -> String {
+    let (Some(used_bytes), Some(total_bytes)) = (used_bytes, total_bytes) else {
+        return "--".to_string();
+    };
+    if total_bytes == 0 {
+        return "--".to_string();
+    }
+    let used_gib = used_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
+    let total_gib = total_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
+    let percent = used_bytes as f64 * 100.0 / total_bytes as f64;
+    format!(
+        "{used_gib:.1}/{total_gib:.1}G {:.0}%",
+        percent.clamp(0.0, 100.0)
+    )
+}
+
+fn read_load_average() -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        return fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|raw| parse_linux_load_average(&raw));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return command_output("sysctl", &["-n", "vm.loadavg"])
+            .and_then(|raw| parse_macos_load_average(&raw));
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+fn read_cpu_percent(previous_cpu: &mut Option<CpuSample>) -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        let current = read_linux_cpu_sample()?;
+        let percent = previous_cpu.and_then(|previous| current.percent_since(previous));
+        *previous_cpu = Some(current);
+        return percent;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = previous_cpu;
+        return read_macos_cpu_percent();
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = previous_cpu;
+        None
+    }
+}
+
+fn read_memory_usage() -> Option<(u64, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        return fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|raw| parse_linux_memory_usage(&raw));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return read_macos_memory_usage();
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_load_average(raw: &str) -> Option<f64> {
+    raw.split_whitespace().next()?.parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_cpu_sample() -> Option<CpuSample> {
+    let raw = fs::read_to_string("/proc/stat").ok()?;
+    parse_linux_cpu_sample(raw.lines().next()?)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_cpu_sample(line: &str) -> Option<CpuSample> {
+    let mut fields = line.split_whitespace();
+    if fields.next()? != "cpu" {
+        return None;
+    }
+    let values = fields
+        .take(10)
+        .map(str::parse::<u64>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .ok()?;
+    if values.len() < 4 {
+        return None;
+    }
+    let idle = values[3] + values.get(4).copied().unwrap_or(0);
+    let total = values.iter().sum();
+    Some(CpuSample { idle, total })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_memory_usage(raw: &str) -> Option<(u64, u64)> {
+    let mut total_kib = None;
+    let mut available_kib = None;
+    for line in raw.lines() {
+        if let Some(value) = line.strip_prefix("MemTotal:") {
+            total_kib = value.split_whitespace().next()?.parse::<u64>().ok();
+        } else if let Some(value) = line.strip_prefix("MemAvailable:") {
+            available_kib = value.split_whitespace().next()?.parse::<u64>().ok();
+        }
+    }
+    let total = total_kib? * 1024;
+    let available = available_kib? * 1024;
+    Some((total.saturating_sub(available), total))
+}
+
+#[cfg(target_os = "macos")]
+fn command_output(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_load_average(raw: &str) -> Option<f64> {
+    raw.split_whitespace()
+        .find_map(|part| part.trim_matches('{').parse::<f64>().ok())
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_cpu_percent() -> Option<f64> {
+    let raw = command_output("ps", &["-A", "-o", "%cpu="])?;
+    let total = raw
+        .lines()
+        .filter_map(|line| line.trim().parse::<f64>().ok())
+        .sum::<f64>();
+    let cores = thread::available_parallelism()
+        .map(|cores| cores.get())
+        .unwrap_or(1) as f64;
+    Some(total / cores)
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_memory_usage() -> Option<(u64, u64)> {
+    let total = command_output("sysctl", &["-n", "hw.memsize"])?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    let raw = command_output("vm_stat", &[])?;
+    let page_size = parse_macos_page_size(&raw)?;
+    let free_pages = parse_macos_vm_stat_pages(&raw, "Pages free:").unwrap_or(0);
+    let inactive_pages = parse_macos_vm_stat_pages(&raw, "Pages inactive:").unwrap_or(0);
+    let speculative_pages = parse_macos_vm_stat_pages(&raw, "Pages speculative:").unwrap_or(0);
+    let available = free_pages
+        .saturating_add(inactive_pages)
+        .saturating_add(speculative_pages)
+        .saturating_mul(page_size);
+    Some((total.saturating_sub(available), total))
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_page_size(raw: &str) -> Option<u64> {
+    let marker = "page size of ";
+    let start = raw.find(marker)? + marker.len();
+    let rest = &raw[start..];
+    let end = rest.find(" bytes")?;
+    rest[..end].parse().ok()
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_vm_stat_pages(raw: &str, prefix: &str) -> Option<u64> {
+    raw.lines()
+        .find_map(|line| line.trim().strip_prefix(prefix))
+        .and_then(|value| value.trim().trim_end_matches('.').parse().ok())
+}
+
 #[derive(Debug, Clone)]
 pub struct TuiInitialState {
     pub sessions: Vec<SessionRecord>,
@@ -713,6 +983,8 @@ struct App {
     animation_frame: usize,
     last_agent: String,
     headroom_metrics: Option<HeadroomMetrics>,
+    system_metrics: Option<SystemMetrics>,
+    system_metrics_sampler: SystemMetricsSampler,
     agent_choices: Vec<String>,
     tool_settings: Vec<ToolLaunchSettings>,
     preview: Option<TerminalPreview>,
@@ -760,6 +1032,8 @@ fn app_from_initial(initial: TuiInitialState) -> App {
         animation_frame: 0,
         last_agent: default_agent,
         headroom_metrics: initial.headroom_metrics,
+        system_metrics: None,
+        system_metrics_sampler: SystemMetricsSampler::default(),
         agent_choices,
         tool_settings: normalize_tool_settings(initial.tool_settings),
         preview: None,
@@ -2593,6 +2867,7 @@ where
     S: FnMut(&[String]) -> Result<Vec<(String, TuiSessionStatus)>>,
 {
     refresh_deck_statuses(app, load_deck_statuses)?;
+    refresh_system_metrics(app);
     refresh_details(app, load_details, true)?;
     initialize_sidebar_width(app, terminal.size()?);
     let preview_worker = PreviewWorker::spawn();
@@ -2617,6 +2892,7 @@ where
         if tui_loop.should_refresh_sessions(now) {
             refresh_sessions(app, handle_action)?;
             refresh_deck_statuses(app, load_deck_statuses)?;
+            refresh_system_metrics(app);
             schedule_details_refresh(app, Instant::now(), true);
             tui_loop.mark_session_refreshed(Instant::now());
             continue;
@@ -3037,7 +3313,7 @@ fn embedded_terminal_area(
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(HEADER_HEIGHT),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
@@ -3055,7 +3331,7 @@ fn terminal_preview_area(
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(HEADER_HEIGHT),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
@@ -3376,6 +3652,10 @@ where
     }
     apply_pending_statuses(app);
     Ok(())
+}
+
+fn refresh_system_metrics(app: &mut App) {
+    app.system_metrics = app.system_metrics_sampler.sample();
 }
 
 fn invalidate_session_cache(app: &mut App, session_id: &str) {
@@ -4739,7 +5019,7 @@ fn initialize_sidebar_width(app: &mut App, size: ratatui::layout::Size) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(HEADER_HEIGHT),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
@@ -4871,7 +5151,7 @@ fn mouse_on_divider(mouse: MouseEvent, area: Rect, app: &App) -> bool {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(HEADER_HEIGHT),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
@@ -4940,7 +5220,7 @@ fn set_sidebar_width_from_mouse(app: &mut App, column: u16, area: Rect) -> bool 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(HEADER_HEIGHT),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
@@ -4963,7 +5243,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(HEADER_HEIGHT),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
@@ -5041,6 +5321,15 @@ fn divider(active: bool) -> Paragraph<'static> {
     Paragraph::new("|").style(style)
 }
 
+fn system_metrics_line(metrics: Option<&SystemMetrics>) -> Line<'static> {
+    Line::from(Span::styled(
+        metrics
+            .map(SystemMetrics::label)
+            .unwrap_or_else(SystemMetrics::unavailable_label),
+        muted_style(),
+    ))
+}
+
 fn header(app: &App, view: &DashboardView) -> Paragraph<'static> {
     let counts = view_status_counts(view);
     let search = if app.query.trim().is_empty() {
@@ -5082,6 +5371,7 @@ fn header(app: &App, view: &DashboardView) -> Paragraph<'static> {
                 .map(|metrics| Span::styled(metrics.label(), muted_style()))
                 .unwrap_or_else(|| Span::raw("")),
         ]),
+        system_metrics_line(app.system_metrics.as_ref()),
         Line::from(filters),
     ])
     .block(panel_block("AGENT HELM"))
@@ -6884,6 +7174,8 @@ mod tests {
             animation_frame: 0,
             last_agent: "shell".to_string(),
             headroom_metrics: None,
+            system_metrics: None,
+            system_metrics_sampler: SystemMetricsSampler::default(),
             agent_choices: default_agent_choices(),
             tool_settings: normalize_tool_settings(Vec::new()),
             preview: None,
@@ -8869,7 +9161,7 @@ mod tests {
         let expected_cursor = new_form_cursor_position(
             form,
             body_layout_for_view(
-                Rect::new(0, 4, 100, 13),
+                Rect::new(0, HEADER_HEIGHT, 100, 12),
                 &app.view(),
                 app.sidebar_width,
                 app.animation_frame,
@@ -9465,6 +9757,77 @@ mod tests {
         let text = buffer_text(terminal.backend().buffer());
 
         assert!(text.contains("hr 12 req 3.5k saved 27.5% $42"));
+    }
+
+    #[test]
+    fn render_header_shows_system_metrics_when_available() {
+        let backend = ratatui::backend::TestBackend::new(120, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
+        let gib = 1024 * 1024 * 1024;
+        app.system_metrics = Some(SystemMetrics {
+            load_average: Some(2.5),
+            cpu_percent: Some(33.3),
+            memory_used_bytes: Some(4 * gib),
+            memory_total_bytes: Some(16 * gib),
+        });
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+
+        assert!(text.contains("sys load 2.50 cpu 33% mem 4.0/16.0G 25%"));
+    }
+
+    #[test]
+    fn system_metrics_label_formats_missing_values() {
+        assert_eq!(
+            SystemMetrics::unavailable_label(),
+            "sys load -- cpu -- mem --"
+        );
+        assert_eq!(
+            SystemMetrics {
+                load_average: Some(1.25),
+                cpu_percent: None,
+                memory_used_bytes: None,
+                memory_total_bytes: None,
+            }
+            .label(),
+            "sys load 1.25 cpu -- mem --"
+        );
+    }
+
+    #[test]
+    fn cpu_sample_calculates_active_percent_between_samples() {
+        let previous = CpuSample {
+            idle: 50,
+            total: 100,
+        };
+        let current = CpuSample {
+            idle: 70,
+            total: 200,
+        };
+
+        assert_eq!(current.percent_since(previous), Some(80.0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_linux_system_metric_sources() {
+        assert_eq!(
+            parse_linux_load_average("2.34 1.23 0.50 1/100 42"),
+            Some(2.34)
+        );
+        assert_eq!(
+            parse_linux_cpu_sample("cpu  100 20 30 400 50 6 7 8 0 0"),
+            Some(CpuSample {
+                idle: 450,
+                total: 621,
+            })
+        );
+        assert_eq!(
+            parse_linux_memory_usage("MemTotal:       8000 kB\nMemAvailable:   3000 kB\n"),
+            Some((5_120_000, 8_192_000))
+        );
     }
 
     #[test]
@@ -10070,6 +10433,8 @@ mod tests {
             animation_frame: 0,
             last_agent: "shell".to_string(),
             headroom_metrics: None,
+            system_metrics: None,
+            system_metrics_sampler: SystemMetricsSampler::default(),
             agent_choices: default_agent_choices(),
             tool_settings: normalize_tool_settings(Vec::new()),
             preview: None,
