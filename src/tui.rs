@@ -5254,39 +5254,66 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     let (sessions, mut session_state) = session_list(&view, app.animation_frame);
     frame.render_stateful_widget(sessions, body.sidebar, &mut session_state);
     frame.render_widget(divider(app.resizing_sidebar), body.divider);
-    match &app.mode {
-        Mode::New(form) => render_create_form(
-            frame,
-            form,
-            &app.agent_choices,
-            &app.group_default_paths,
-            &app.status_message,
-            body.detail,
-        ),
-        Mode::CreateGroup(form) => {
-            frame.render_widget(create_group_form(form, &app.status_message), body.detail)
+    let cursor = match &app.mode {
+        Mode::New(form) => {
+            render_create_form(
+                frame,
+                form,
+                &app.agent_choices,
+                &app.group_default_paths,
+                &app.status_message,
+                body.detail,
+            );
+            new_form_cursor_position(form, body.detail)
         }
-        Mode::GroupSettings(form) => frame.render_widget(
-            group_settings_form(form, &app.agent_choices, &app.status_message),
-            body.detail,
-        ),
-        Mode::Fork(form) => frame.render_widget(fork_form(form, &app.status_message), body.detail),
-        Mode::Session(_) => render_session_terminal(frame, app, &view, body.detail),
-        Mode::Move(form) => frame.render_widget(
-            move_form(form, &app.group_default_paths, &app.status_message),
-            body.detail,
-        ),
+        Mode::CreateGroup(form) => {
+            frame.render_widget(create_group_form(form, &app.status_message), body.detail);
+            group_form_cursor_position(form, body.detail)
+        }
+        Mode::GroupSettings(form) => {
+            frame.render_widget(
+                group_settings_form(form, &app.agent_choices, &app.status_message),
+                body.detail,
+            );
+            group_settings_cursor_position(form, body.detail)
+        }
+        Mode::Fork(form) => {
+            frame.render_widget(fork_form(form, &app.status_message), body.detail);
+            fork_form_cursor_position(form, body.detail)
+        }
+        Mode::Session(_) => {
+            render_session_terminal(frame, app, &view, body.detail);
+            None
+        }
+        Mode::Move(form) => {
+            frame.render_widget(
+                move_form(form, &app.group_default_paths, &app.status_message),
+                body.detail,
+            );
+            move_form_cursor_position(form, body.detail)
+        }
         Mode::Rename(form) => {
-            frame.render_widget(rename_form(form, &app.status_message), body.detail)
+            frame.render_widget(rename_form(form, &app.status_message), body.detail);
+            rename_form_cursor_position(form, body.detail)
         }
         Mode::ToolSettings(form) => {
             frame.render_widget(detail_panel(app, &view), body.detail);
             let popup = tool_settings_popup_area(frame.area());
             frame.render_widget(Clear, popup);
             frame.render_widget(tool_settings_form(form, &app.status_message), popup);
+            tool_settings_cursor_position(form, popup)
         }
-        Mode::Help => frame.render_widget(help_panel(), body.detail),
-        _ => render_dashboard_detail(frame, app, &view, body.detail),
+        Mode::Help => {
+            frame.render_widget(help_panel(), body.detail);
+            None
+        }
+        _ => {
+            render_dashboard_detail(frame, app, &view, body.detail);
+            None
+        }
+    };
+    if let Some((x, y)) = cursor {
+        frame.set_cursor_position((x, y));
     }
     frame.render_widget(footer(app), chunks[2]);
 }
@@ -6061,14 +6088,7 @@ fn text_entry_style(active: bool, placeholder: bool) -> Style {
     }
 }
 
-fn text_entry_spans(form: &NewForm, field: NewField, active: bool) -> Vec<Span<'static>> {
-    let value = form.field_value(field);
-    let placeholder = field == NewField::Name && value.trim().is_empty();
-    let display = if placeholder {
-        form.default_name()
-    } else {
-        value.to_string()
-    };
+fn text_field_spans(value: String, active: bool, placeholder: bool) -> Vec<Span<'static>> {
     let border_style = if active {
         active_border_style().add_modifier(Modifier::BOLD)
     } else {
@@ -6078,10 +6098,21 @@ fn text_entry_spans(form: &NewForm, field: NewField, active: bool) -> Vec<Span<'
     vec![
         Span::styled("[", border_style),
         Span::styled(" ", value_style),
-        Span::styled(display, value_style),
+        Span::styled(value, value_style),
         Span::styled(" ", value_style),
         Span::styled("]", border_style),
     ]
+}
+
+fn text_entry_spans(form: &NewForm, field: NewField, active: bool) -> Vec<Span<'static>> {
+    let value = form.field_value(field);
+    let placeholder = field == NewField::Name && value.trim().is_empty();
+    let display = if placeholder {
+        form.default_name()
+    } else {
+        value.to_string()
+    };
+    text_field_spans(display, active, placeholder)
 }
 
 fn new_form_cursor_position(form: &NewForm, area: Rect) -> Option<(u16, u16)> {
@@ -6107,6 +6138,76 @@ fn new_form_cursor_position(form: &NewForm, area: Rect) -> Option<(u16, u16)> {
     let x = area.x.saturating_add(24).saturating_add(value_width);
     let max_x = area.x.saturating_add(area.width).saturating_sub(2);
     Some((x.min(max_x), row))
+}
+
+fn text_field_cursor_position(
+    area: Rect,
+    row_index: usize,
+    label_width: u16,
+    value: &str,
+) -> Option<(u16, u16)> {
+    if area.width < 4 || area.height < 3 {
+        return None;
+    }
+
+    let row = area.y.saturating_add(1 + row_index as u16);
+    if row >= area.y.saturating_add(area.height).saturating_sub(1) {
+        return None;
+    }
+
+    let value_width = display_width(value);
+    let x = area
+        .x
+        .saturating_add(label_width)
+        .saturating_add(6)
+        .saturating_add(value_width);
+    let max_x = area.x.saturating_add(area.width).saturating_sub(2);
+    Some((x.min(max_x), row))
+}
+
+fn group_form_cursor_position(form: &GroupForm, area: Rect) -> Option<(u16, u16)> {
+    let field = form.current_field();
+    let row = GROUP_FIELDS
+        .iter()
+        .position(|candidate| *candidate == field)?;
+    text_field_cursor_position(area, row, 18, form.field_value(field))
+}
+
+fn group_settings_cursor_position(form: &GroupSettingsForm, area: Rect) -> Option<(u16, u16)> {
+    if form.current_field() != GroupSettingsField::DefaultPath {
+        return None;
+    }
+    text_field_cursor_position(area, 1, 18, &form.default_project_path)
+}
+
+fn fork_form_cursor_position(form: &ForkForm, area: Rect) -> Option<(u16, u16)> {
+    let field = form.current_field();
+    if field == ForkField::CarryState {
+        return None;
+    }
+    let row = FORK_FIELDS
+        .iter()
+        .position(|candidate| *candidate == field)?
+        + 1;
+    text_field_cursor_position(area, row, 18, form.field_value(field))
+}
+
+fn move_form_cursor_position(form: &MoveForm, area: Rect) -> Option<(u16, u16)> {
+    text_field_cursor_position(area, 0, 18, &form.group_name)
+}
+
+fn rename_form_cursor_position(form: &RenameForm, area: Rect) -> Option<(u16, u16)> {
+    text_field_cursor_position(area, 0, 18, &form.name)
+}
+
+fn tool_settings_cursor_position(form: &ToolSettingsForm, area: Rect) -> Option<(u16, u16)> {
+    match form.current_field() {
+        ToolSettingsField::Executable => text_field_cursor_position(area, 2, 10, &form.executable),
+        ToolSettingsField::Flags => text_field_cursor_position(area, 3, 10, &form.flags),
+        ToolSettingsField::Tool | ToolSettingsField::Installed | ToolSettingsField::Worktree => {
+            None
+        }
+    }
 }
 
 fn create_form(
@@ -6179,23 +6280,18 @@ fn create_group_form(form: &GroupForm, status_message: &Option<String>) -> Parag
         } else {
             Style::default()
         };
-        let border_style = if active {
-            active_border_style().add_modifier(Modifier::BOLD)
-        } else {
-            border_style()
-        };
-        let value_style = text_entry_style(active, false);
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::styled(marker, style),
             Span::raw(" "),
             Span::styled(format!("{:<18}", field.label()), style),
             Span::raw(" "),
-            Span::styled("[", border_style),
-            Span::styled(" ", value_style),
-            Span::styled(form.field_value(field).to_string(), value_style),
-            Span::styled(" ", value_style),
-            Span::styled("]", border_style),
-        ]));
+        ];
+        spans.extend(text_field_spans(
+            form.field_value(field).to_string(),
+            active,
+            false,
+        ));
+        lines.push(Line::from(spans));
     }
 
     if let Some(message) = status_message {
@@ -6259,20 +6355,10 @@ fn tool_settings_form(
                 spans.push(Span::raw(checkbox));
             }
             ToolSettingsField::Executable => {
-                let value = if form.executable.trim().is_empty() {
-                    "-"
-                } else {
-                    form.executable.as_str()
-                };
-                spans.push(Span::raw(value.to_string()));
+                spans.extend(text_field_spans(form.executable.clone(), active, false));
             }
             ToolSettingsField::Flags => {
-                let value = if form.flags.trim().is_empty() {
-                    "-"
-                } else {
-                    form.flags.as_str()
-                };
-                spans.push(Span::raw(value.to_string()));
+                spans.extend(text_field_spans(form.flags.clone(), active, false));
             }
             ToolSettingsField::Worktree => {
                 spans.push(Span::raw(worktree_label(form.current_tool().worktree)));
@@ -6322,14 +6408,11 @@ fn group_settings_form(
         ];
         match field {
             GroupSettingsField::DefaultPath => {
-                let value_style = text_entry_style(active, false);
-                spans.extend([
-                    Span::styled("[", border_style()),
-                    Span::styled(" ", value_style),
-                    Span::styled(form.default_project_path.clone(), value_style),
-                    Span::styled(" ", value_style),
-                    Span::styled("]", border_style()),
-                ]);
+                spans.extend(text_field_spans(
+                    form.default_project_path.clone(),
+                    active,
+                    false,
+                ));
             }
             GroupSettingsField::DefaultAgent => {
                 spans.extend(group_settings_agent_spans(form, agent_choices));
@@ -6424,7 +6507,11 @@ fn fork_form(form: &ForkForm, status_message: &Option<String>) -> Paragraph<'sta
             let checkbox = if form.carry_state { "[x]" } else { "[ ]" };
             spans.push(Span::raw(checkbox));
         } else {
-            spans.push(Span::raw(form.field_value(field).to_string()));
+            spans.extend(text_field_spans(
+                form.field_value(field).to_string(),
+                active,
+                false,
+            ));
         }
         lines.push(Line::from(spans));
     }
@@ -6450,9 +6537,11 @@ fn move_form(
     let group_name = form.group_name.trim();
     let mut group_line = vec![
         Span::styled(">", title_style()),
-        Span::raw(" Group "),
-        Span::raw(form.group_name.clone()),
+        Span::raw(" "),
+        Span::styled(format!("{:<18}", "Group"), title_style()),
+        Span::raw(" "),
     ];
+    group_line.extend(text_field_spans(form.group_name.clone(), true, false));
     if !group_name.is_empty() && !group_default_paths.contains_key(group_name) {
         group_line.push(Span::styled(" (new)", muted_style()));
     }
@@ -6460,7 +6549,7 @@ fn move_form(
     let mut lines = vec![Line::from(group_line), Line::from("")];
     lines.push(Line::from(Span::styled("Existing groups", muted_style())));
     if group_default_paths.is_empty() {
-        lines.push(Line::from(Span::styled("  none", muted_style())));
+        lines.push(Line::from(Span::styled(" none", muted_style())));
     } else {
         for name in group_default_paths.keys() {
             let selected = name == group_name;
@@ -6491,11 +6580,14 @@ fn move_form(
 }
 
 fn rename_form(form: &RenameForm, status_message: &Option<String>) -> Paragraph<'static> {
-    let mut lines = vec![Line::from(vec![
+    let mut spans = vec![
         Span::styled(">", title_style()),
-        Span::raw(" Name "),
-        Span::raw(form.name.clone()),
-    ])];
+        Span::raw(" "),
+        Span::styled(format!("{:<18}", "Name"), title_style()),
+        Span::raw(" "),
+    ];
+    spans.extend(text_field_spans(form.name.clone(), true, false));
+    let mut lines = vec![Line::from(spans)];
     if let Some(message) = status_message {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -9171,6 +9263,134 @@ mod tests {
         .unwrap();
         let cursor = terminal.backend().cursor_position();
         assert_eq!((cursor.x, cursor.y), expected_cursor);
+    }
+
+    #[test]
+    fn cursor_positions_cover_all_text_entry_fields() {
+        let area = Rect::new(0, 0, 100, 18);
+        let new_name = NewForm {
+            name: "deploy".to_string(),
+            ..NewForm::default()
+        };
+        assert!(new_form_cursor_position(&new_name, area).is_some());
+        let new_path = NewForm {
+            field_index: 2,
+            ..NewForm::default()
+        };
+        assert!(new_form_cursor_position(&new_path, area).is_some());
+
+        let mut group = GroupForm::new();
+        group.name = "ops".to_string();
+        assert!(group_form_cursor_position(&group, area).is_some());
+        group.current_field = GroupField::DefaultPath;
+        group.default_project_path = "/tmp/ops".to_string();
+        assert!(group_form_cursor_position(&group, area).is_some());
+
+        let group_defaults = GroupDefaults {
+            name: "ops".to_string(),
+            default_project_path: "/tmp/ops".to_string(),
+            default_agent: None,
+            default_worktree: None,
+            default_carry_state: None,
+        };
+        let group_settings = GroupSettingsForm::from_group(&group_defaults);
+        assert!(group_settings_cursor_position(&group_settings, area).is_some());
+
+        let session = SessionSummary::from(&record("1", "ops", "deploy", false));
+        let mut fork = ForkForm::for_session(&session);
+        assert!(fork_form_cursor_position(&fork, area).is_some());
+        fork.field_index = 1;
+        assert!(fork_form_cursor_position(&fork, area).is_some());
+        fork.field_index = 2;
+        fork.worktree = "branch".to_string();
+        assert!(fork_form_cursor_position(&fork, area).is_some());
+        fork.field_index = 3;
+        assert_eq!(fork_form_cursor_position(&fork, area), None);
+        fork.field_index = 4;
+        assert!(fork_form_cursor_position(&fork, area).is_some());
+
+        let move_form = MoveForm {
+            session_id: "1".to_string(),
+            group_name: "ops".to_string(),
+        };
+        assert!(move_form_cursor_position(&move_form, area).is_some());
+
+        let rename = RenameForm {
+            session_id: "1".to_string(),
+            name: "deploy".to_string(),
+        };
+        assert!(rename_form_cursor_position(&rename, area).is_some());
+
+        let mut tools = ToolSettingsForm::new(&normalize_tool_settings(Vec::new()), "codex");
+        tools.field_index = 2;
+        assert!(tool_settings_cursor_position(&tools, area).is_some());
+        tools.field_index = 3;
+        assert!(tool_settings_cursor_position(&tools, area).is_some());
+        tools.field_index = 4;
+        assert_eq!(tool_settings_cursor_position(&tools, area), None);
+    }
+
+    #[test]
+    fn render_text_entry_forms_show_input_boxes_and_cursor() {
+        let mut cases = Vec::new();
+        cases.push((
+            Mode::CreateGroup(GroupForm {
+                name: "ops".to_string(),
+                default_project_path: String::new(),
+                current_field: GroupField::Name,
+            }),
+            "[ ops ]",
+        ));
+        cases.push((
+            Mode::GroupSettings(GroupSettingsForm::from_group(&GroupDefaults {
+                name: "ops".to_string(),
+                default_project_path: "/tmp/ops".to_string(),
+                default_agent: None,
+                default_worktree: None,
+                default_carry_state: None,
+            })),
+            "[ /tmp/ops ]",
+        ));
+        cases.push((
+            Mode::Fork(ForkForm::for_session(&SessionSummary::from(&record(
+                "1", "ops", "deploy", false,
+            )))),
+            "[ deploy fork ]",
+        ));
+        cases.push((
+            Mode::Move(MoveForm {
+                session_id: "1".to_string(),
+                group_name: "ops".to_string(),
+            }),
+            "[ ops ]",
+        ));
+        cases.push((
+            Mode::Rename(RenameForm {
+                session_id: "1".to_string(),
+                name: "deploy".to_string(),
+            }),
+            "[ deploy ]",
+        ));
+        let mut tool_settings =
+            ToolSettingsForm::new(&normalize_tool_settings(Vec::new()), "codex");
+        tool_settings.field_index = 2;
+        cases.push((Mode::ToolSettings(tool_settings), "[ codex ]"));
+
+        for (mode, expected_input) in cases {
+            let backend = ratatui::backend::TestBackend::new(120, 20);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let mut app = test_app(vec![record("1", "ops", "deploy", false)]);
+            app.mode = mode;
+
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let text = buffer_text(terminal.backend().buffer());
+
+            assert!(
+                text.contains(expected_input),
+                "{expected_input} missing from\n{text}"
+            );
+            assert!(terminal.backend().cursor_visible());
+        }
     }
 
     #[test]
